@@ -120,6 +120,29 @@ func TestPrint_MediumViolationUsesWarningBadge(t *testing.T) {
 	}
 }
 
+func TestPrintSkippedViolationReason(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "with reason", reason: "Managed by the platform", want: "── [SKIPPED] Cluster check · GKE CIS 5.6.4 · Managed by the platform\n"},
+		{name: "without reason", want: "── [SKIPPED] Cluster check · GKE CIS 5.6.4\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				printSkippedViolation(engine.Violation{
+					RuleID: "gke/cis/5.6.4", CISControl: "5.6.4",
+					Title: "Cluster check", SkipReason: tt.reason,
+				})
+			})
+			if out != tt.want {
+				t.Errorf("got %q, want %q", out, tt.want)
+			}
+		})
+	}
+}
+
 func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
 	description := strings.Repeat("More detail about this failure. ", 10)
 	for _, tc := range []struct {

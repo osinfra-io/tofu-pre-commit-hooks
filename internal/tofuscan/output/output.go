@@ -86,10 +86,11 @@ func printSkippedViolation(v engine.Violation) {
 	if strings.HasPrefix(v.RuleID, "gke/") {
 		benchmark = "GKE CIS"
 	}
-	fmt.Printf("%s── [SKIPPED] %s · %s %s%s\n",
-		output.DarkGray, v.Title,
-		benchmark, v.CISControl, output.Reset,
-	)
+	line := fmt.Sprintf("── [SKIPPED] %s · %s %s", v.Title, benchmark, v.CISControl)
+	if v.SkipReason != "" {
+		line += " · " + v.SkipReason
+	}
+	fmt.Printf("%s%s%s\n", output.DarkGray, line, output.Reset)
 }
 
 func printSummary(violations, skipped []engine.Violation, resourceTypes map[string]struct{}) {

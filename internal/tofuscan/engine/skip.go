@@ -43,7 +43,8 @@ func ParseSkipDirectives(files []string) *SkipDirectives {
 // Filter partitions violations into kept and skipped based on skip directives.
 func (sd *SkipDirectives) Filter(violations []Violation) (kept, skipped []Violation) {
 	for _, v := range violations {
-		if sd.shouldSkip(v) {
+		if reason, ok := sd.skipReason(v); ok {
+			v.SkipReason = reason
 			skipped = append(skipped, v)
 		} else {
 			kept = append(kept, v)
@@ -52,15 +53,15 @@ func (sd *SkipDirectives) Filter(violations []Violation) (kept, skipped []Violat
 	return kept, skipped
 }
 
-func (sd *SkipDirectives) shouldSkip(v Violation) bool {
+func (sd *SkipDirectives) skipReason(v Violation) (string, bool) {
 	if resSkips, ok := sd.resourceLevel[v.File]; ok {
 		if skips, ok := resSkips[v.Resource]; ok {
-			if _, ok := skips[v.CISControl]; ok {
-				return true
+			if reason, ok := skips[v.CISControl]; ok {
+				return reason, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // parseFileSkips scans a single file for skip comments inside resource blocks

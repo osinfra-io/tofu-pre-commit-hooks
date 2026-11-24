@@ -114,6 +114,7 @@ func TestFilterSkipped(t *testing.T) {
 	violations := []Violation{
 		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.6.4", RuleID: "gke/cis/5.6.4"},
 		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.5.1", RuleID: "gke/cis/5.5.1"},
+		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.6.3", RuleID: "gke/cis/5.6.3"},
 		{File: "a.tofu", Resource: "google_compute_firewall.allow", CISControl: "3.3", RuleID: "gcp/cis/3.3"},
 		{File: "", Resource: "global", CISControl: "2.2", RuleID: "gcp/cis/2.2"},
 	}
@@ -121,7 +122,7 @@ func TestFilterSkipped(t *testing.T) {
 	sd := &SkipDirectives{
 		resourceLevel: map[string]map[string]map[string]string{
 			"a.tofu": {
-				"google_container_cluster.primary": {"5.6.4": "not needed"},
+				"google_container_cluster.primary": {"5.6.4": "not needed", "5.6.3": ""},
 			},
 		},
 	}
@@ -131,13 +132,15 @@ func TestFilterSkipped(t *testing.T) {
 	if len(kept) != 3 {
 		t.Errorf("expected 3 kept violations, got %d", len(kept))
 	}
-	if len(skipped) != 1 {
-		t.Errorf("expected 1 skipped violation, got %d", len(skipped))
+	if len(skipped) != 2 {
+		t.Fatalf("expected 2 skipped violations, got %d", len(skipped))
 	}
 
-	// Skipped: only 5.6.4 on "primary"
-	if len(skipped) > 0 && skipped[0].CISControl != "5.6.4" {
-		t.Errorf("expected skipped violation for CIS 5.6.4, got %s", skipped[0].CISControl)
+	if skipped[0].CISControl != "5.6.4" || skipped[0].SkipReason != "not needed" {
+		t.Errorf("expected CIS 5.6.4 with reason, got %+v", skipped[0])
+	}
+	if skipped[1].CISControl != "5.6.3" || skipped[1].SkipReason != "" {
+		t.Errorf("expected CIS 5.6.3 without reason, got %+v", skipped[1])
 	}
 }
 
