@@ -180,6 +180,64 @@ func TestPassFixtureNoViolations(t *testing.T) {
 	}
 }
 
+func TestDynamicBlocksPassDNSSECAndFlowLogs(t *testing.T) {
+	dir := t.TempDir()
+	variablesFile := filepath.Join(dir, "variables.tofu")
+	mainFile := filepath.Join(dir, "main.tofu")
+	variables := `variable "enable_dnssec" {
+  type = bool
+}
+
+variable "enable_flow_logs" {
+  type = bool
+}
+`
+	main := `resource "google_dns_managed_zone" "dynamic_dnssec_zone" {
+  name     = "dynamic-dnssec-zone"
+  dns_name = "dynamic.example.com."
+
+  dynamic "dnssec_config" {
+    for_each = var.enable_dnssec ? [1] : []
+    content {
+      state = "on"
+    }
+  }
+}
+
+resource "google_compute_subnetwork" "dynamic_log_config_subnet" {
+  name          = "dynamic-log-config-subnet"
+  ip_cidr_range = "10.1.0.0/24"
+  network       = "default"
+  region        = "us-central1"
+
+  dynamic "log_config" {
+    for_each = var.enable_flow_logs ? [1] : []
+    content {
+      aggregation_interval = "INTERVAL_5_SEC"
+    }
+  }
+}
+`
+	for path, content := range map[string]string{
+		variablesFile: variables,
+		mainFile:      main,
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := Run(context.Background(), []string{variablesFile, mainFile}, policies.FS)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, violation := range result.Violations {
+		if violation.RuleID == "gcp/cis/3.3" || violation.RuleID == "gcp/cis/3.10" {
+			t.Errorf("unexpected violation: %s (%s)", violation.RuleID, violation.Title)
+		}
+	}
+}
+
 func TestViolationFields(t *testing.T) {
 	files := []string{"../../../test/tofuscan/fixtures/fail/main.tofu"}
 	result, err := Run(context.Background(), files, policies.FS)
