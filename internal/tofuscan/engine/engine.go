@@ -38,10 +38,11 @@ type Violation struct {
 }
 
 type symbolTable struct {
-	locals         map[string]interface{}
-	variables      map[string]interface{}
-	localValues    cty.Value
-	variableValues cty.Value
+	locals           map[string]interface{}
+	variables        map[string]interface{}
+	localExpressions map[string]*hclsyntax.Attribute
+	localValues      cty.Value
+	variableValues   cty.Value
 }
 
 // RunResult holds the output of a policy evaluation run.
@@ -92,6 +93,7 @@ func Run(ctx context.Context, files []string, policiesFS fs.FS) (*RunResult, err
 			file,
 			filepath.ToSlash(filepath.Clean(file)),
 			symbols,
+			false,
 			stack,
 			filesByDir,
 			moduleBlocksByFile,
@@ -166,9 +168,11 @@ func Run(ctx context.Context, files []string, policiesFS fs.FS) (*RunResult, err
 }
 
 type moduleInvocation struct {
-	each       *resourceEachInstance
-	key        string
-	unresolved bool
+	each          *resourceEachInstance
+	countIndex    cty.Value
+	hasCountIndex bool
+	key           string
+	unresolved    bool
 }
 
 func groupFilesByDir(files []string) map[string][]string {
@@ -247,6 +251,9 @@ func localModuleDirectory(file string, block *hclsyntax.Block, symbols *symbolTa
 	if path, subdirectory, hasSubdirectory := strings.Cut(source, "//"); hasSubdirectory {
 		source = filepath.Join(path, subdirectory)
 	}
+	if filepath.IsAbs(source) {
+		return filepath.Clean(source), true
+	}
 	return filepath.Clean(filepath.Join(filepath.Dir(file), source)), true
 }
 
@@ -254,6 +261,20 @@ func evaluateHCLExpression(
 	expression hclsyntax.Expression,
 	symbols *symbolTable,
 	each *resourceEachInstance,
+	countIndex ...cty.Value,
+) (cty.Value, bool) {
+	value, ok := evaluateHCLExpressionValue(expression, symbols, each, countIndex...)
+	if !ok || !value.IsKnown() {
+		return cty.NilVal, false
+	}
+	return value, true
+}
+
+func evaluateHCLExpressionValue(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+	each *resourceEachInstance,
+	countIndex ...cty.Value,
 ) (cty.Value, bool) {
 	if symbols == nil {
 		return cty.NilVal, false
@@ -269,20 +290,96 @@ func evaluateHCLExpression(
 			"value": each.value,
 		})
 	}
+	if len(countIndex) > 0 {
+		variables["count"] = cty.ObjectVal(map[string]cty.Value{
+			"index": countIndex[0],
+		})
+	}
 	value, diags := expression.Value(&hcl.EvalContext{
 		Functions: hclFunctions(),
 		Variables: variables,
 	})
-	if diags.HasErrors() || !value.IsKnown() || value.IsNull() {
+	if diags.HasErrors() {
 		return cty.NilVal, false
 	}
 	return value, true
 }
 
+func singleObjectModuleInvocation(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+) (moduleInvocation, bool) {
+	object, ok := moduleForEachObjectExpression(expression, symbols, make(map[string]struct{}))
+	if !ok || len(object.Items) != 1 {
+		return moduleInvocation{}, false
+	}
+
+	item := object.Items[0]
+	key, keyOK := evaluateHCLExpressionValue(item.KeyExpr, symbols, nil)
+	if !keyOK || !key.IsKnown() || key.IsNull() {
+		key = cty.UnknownVal(cty.String)
+	} else if converted, err := convert.Convert(key, cty.String); err == nil {
+		key = converted
+	} else {
+		key = cty.UnknownVal(cty.String)
+	}
+
+	value, valueOK := evaluateHCLExpressionValue(item.ValueExpr, symbols, nil)
+	if !valueOK {
+		value = cty.DynamicVal
+	}
+	invocation := moduleInvocation{
+		each: &resourceEachInstance{
+			key:   key,
+			value: value,
+		},
+	}
+	if key.IsKnown() && !key.IsNull() {
+		if goKey, err := ctyToGo(key); err == nil {
+			invocation.key = fmt.Sprint(goKey)
+		}
+	} else {
+		invocation.key = "known-entry"
+	}
+	return invocation, true
+}
+
+func moduleForEachObjectExpression(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+	seen map[string]struct{},
+) (*hclsyntax.ObjectConsExpr, bool) {
+	switch typed := expression.(type) {
+	case *hclsyntax.ObjectConsExpr:
+		return typed, true
+	case *hclsyntax.ScopeTraversalExpr:
+		traversal := typed.Traversal
+		if len(traversal) != 2 {
+			return nil, false
+		}
+		root, rootOK := traversal[0].(hcl.TraverseRoot)
+		name, nameOK := traversal[1].(hcl.TraverseAttr)
+		if !rootOK || root.Name != "local" || !nameOK {
+			return nil, false
+		}
+		if _, cyclic := seen[name.Name]; cyclic {
+			return nil, false
+		}
+		attribute, exists := symbols.localExpressions[name.Name]
+		if !exists {
+			return nil, false
+		}
+		seen[name.Name] = struct{}{}
+		return moduleForEachObjectExpression(attribute.Expr, symbols, seen)
+	default:
+		return nil, false
+	}
+}
+
 func moduleInvocations(block *hclsyntax.Block, symbols *symbolTable) []moduleInvocation {
 	if countAttr, hasCount := block.Body.Attributes["count"]; hasCount {
 		countValue, ok := evaluateHCLExpression(countAttr.Expr, symbols, nil)
-		if !ok || countValue.Type() != cty.Number {
+		if !ok || countValue.IsNull() || countValue.Type() != cty.Number {
 			return []moduleInvocation{{unresolved: true}}
 		}
 		count, accuracy := countValue.AsBigFloat().Int64()
@@ -292,7 +389,15 @@ func moduleInvocations(block *hclsyntax.Block, symbols *symbolTable) []moduleInv
 		if count == 0 {
 			return nil
 		}
-		return []moduleInvocation{{}}
+		invocations := make([]moduleInvocation, 0, count)
+		for index := int64(0); index < count; index++ {
+			invocations = append(invocations, moduleInvocation{
+				countIndex:    cty.NumberIntVal(index),
+				hasCountIndex: true,
+				key:           strconv.FormatInt(index, 10),
+			})
+		}
+		return invocations
 	}
 
 	forEachAttr, hasForEach := block.Body.Attributes["for_each"]
@@ -300,8 +405,20 @@ func moduleInvocations(block *hclsyntax.Block, symbols *symbolTable) []moduleInv
 		return []moduleInvocation{{}}
 	}
 
-	forEachValue, ok := evaluateHCLExpression(forEachAttr.Expr, symbols, nil)
+	forEachValue, ok := evaluateHCLExpressionValue(forEachAttr.Expr, symbols, nil)
 	if !ok {
+		if invocation, ok := singleObjectModuleInvocation(forEachAttr.Expr, symbols); ok {
+			return []moduleInvocation{invocation}
+		}
+		return []moduleInvocation{{unresolved: true}}
+	}
+	if !forEachValue.IsKnown() {
+		if invocation, ok := singleObjectModuleInvocation(forEachAttr.Expr, symbols); ok {
+			return []moduleInvocation{invocation}
+		}
+		return []moduleInvocation{{unresolved: true}}
+	}
+	if forEachValue.IsNull() {
 		return []moduleInvocation{{unresolved: true}}
 	}
 	goValue, err := ctyToGo(forEachValue)
@@ -331,6 +448,7 @@ func moduleInputOverrides(
 	block *hclsyntax.Block,
 	symbols *symbolTable,
 	each *resourceEachInstance,
+	countIndex ...cty.Value,
 ) map[string]cty.Value {
 	overrides := make(map[string]cty.Value)
 	for name, attribute := range block.Body.Attributes {
@@ -338,23 +456,20 @@ func moduleInputOverrides(
 		case "source", "for_each", "count", "providers", "depends_on", "version":
 			continue
 		}
-		value, ok := evaluateHCLExpression(attribute.Expr, symbols, each)
+		value, ok := evaluateHCLExpression(attribute.Expr, symbols, each, countIndex...)
 		if !ok {
-			value = unresolvedModuleInput(name)
+			value = cty.DynamicVal
 		}
 		overrides[name] = value
 	}
 	return overrides
 }
 
-func unresolvedModuleInput(name string) cty.Value {
-	return cty.StringVal("${module_input_unresolved." + name + "}")
-}
-
 func collectModuleInstanceConfigs(
 	parentFile string,
 	parentNamespace string,
 	parentSymbols *symbolTable,
+	parentUnresolved bool,
 	stack map[string]struct{},
 	filesByDir map[string][]string,
 	moduleBlocksByFile map[string][]*hclsyntax.Block,
@@ -375,7 +490,11 @@ func collectModuleInstanceConfigs(
 
 		invocations := moduleInvocations(block, parentSymbols)
 		for invocationIndex, invocation := range invocations {
-			overrides := moduleInputOverrides(block, parentSymbols, invocation.each)
+			var countIndex []cty.Value
+			if invocation.hasCountIndex {
+				countIndex = append(countIndex, invocation.countIndex)
+			}
+			overrides := moduleInputOverrides(block, parentSymbols, invocation.each, countIndex...)
 			childSymbols, err := loadSymbolTableFromFilesWithOverrides(
 				filesByDir[childDir],
 				overrides,
@@ -399,12 +518,15 @@ func collectModuleInstanceConfigs(
 				instanceConfig := normalizeConfigWithSymbols(childConfig, childSymbols)
 				instanceConfig = namespaceModuleResources(instanceConfig, namespace)
 				instanceKey := fmt.Sprintf("%s#module#%s#%d#%s", parentFile, namespace, invocationIndex, childFile)
-				moduleConfigs[instanceKey] = instanceConfig
+				if !parentUnresolved && !invocation.unresolved {
+					moduleConfigs[instanceKey] = instanceConfig
+				}
 
 				if err := collectModuleInstanceConfigs(
 					childFile,
 					namespace,
 					childSymbols,
+					parentUnresolved || invocation.unresolved,
 					stack,
 					filesByDir,
 					moduleBlocksByFile,
@@ -1314,6 +1436,8 @@ func loadSymbolTableFromFilesWithOverrides(
 ) (*symbolTable, error) {
 	variables := make(map[string]cty.Value)
 	variableTypes := make(map[string]cty.Type)
+	variableHasDefault := make(map[string]bool)
+	variableNullable := make(map[string]bool)
 	pending := make(map[string]*hclsyntax.Attribute)
 
 	for _, file := range files {
@@ -1334,6 +1458,7 @@ func loadSymbolTableFromFilesWithOverrides(
 
 		for name, value := range collectVariableDefaults(body) {
 			variables[name] = value
+			variableHasDefault[name] = true
 		}
 
 		for _, block := range body.Blocks {
@@ -1341,10 +1466,18 @@ func loadSymbolTableFromFilesWithOverrides(
 				continue
 			}
 			name := block.Labels[0]
+			variableNullable[name] = true
 			if typeAttr, ok := block.Body.Attributes["type"]; ok {
 				constraint, typeDiags := typeexpr.TypeConstraint(typeAttr.Expr)
 				if !typeDiags.HasErrors() {
 					variableTypes[name] = constraint
+				}
+			}
+			if nullableAttr, ok := block.Body.Attributes["nullable"]; ok {
+				nullableValue, nullableDiags := nullableAttr.Expr.Value(nil)
+				if !nullableDiags.HasErrors() && nullableValue.IsKnown() &&
+					!nullableValue.IsNull() && nullableValue.Type() == cty.Bool {
+					variableNullable[name] = nullableValue.True()
 				}
 			}
 		}
@@ -1359,13 +1492,25 @@ func loadSymbolTableFromFilesWithOverrides(
 		}
 	}
 
+	for name := range variableNullable {
+		if !variableHasDefault[name] {
+			variables[name] = unknownVariableValue(name, variableTypes)
+		}
+	}
+
 	for name, value := range overrides {
+		if value.IsKnown() && value.IsNull() && !variableNullable[name] {
+			if variableHasDefault[name] {
+				continue
+			}
+			value = unknownVariableValue(name, variableTypes)
+		}
 		if variableType, ok := variableTypes[name]; ok &&
 			variableType != cty.DynamicPseudoType &&
 			variableType != cty.NilType {
 			converted, err := convert.Convert(value, variableType)
 			if err != nil {
-				value = unresolvedModuleInput(name)
+				value = cty.UnknownVal(variableType)
 			} else {
 				value = converted
 			}
@@ -1373,6 +1518,10 @@ func loadSymbolTableFromFilesWithOverrides(
 		variables[name] = value
 	}
 
+	localExpressions := make(map[string]*hclsyntax.Attribute, len(pending))
+	for name, attribute := range pending {
+		localExpressions[name] = attribute
+	}
 	locals := resolveLocals(pending, variables) // resolves inter-local and var references
 
 	variableValues, err := ctyMapToGo(variables)
@@ -1385,11 +1534,21 @@ func loadSymbolTableFromFilesWithOverrides(
 	}
 
 	return &symbolTable{
-		locals:         localValues,
-		variables:      variableValues,
-		localValues:    ctyObject(locals),
-		variableValues: ctyObject(variables),
+		locals:           localValues,
+		variables:        variableValues,
+		localExpressions: localExpressions,
+		localValues:      ctyObject(locals),
+		variableValues:   ctyObject(variables),
 	}, nil
+}
+
+func unknownVariableValue(name string, variableTypes map[string]cty.Type) cty.Value {
+	if variableType, ok := variableTypes[name]; ok &&
+		variableType != cty.DynamicPseudoType &&
+		variableType != cty.NilType {
+		return cty.UnknownVal(variableType)
+	}
+	return cty.DynamicVal
 }
 
 func collectVariableDefaults(body *hclsyntax.Body) map[string]cty.Value {
@@ -1478,7 +1637,7 @@ func ctyMapToGo(values map[string]cty.Value) (map[string]interface{}, error) {
 
 func ctyToGo(value cty.Value) (interface{}, error) {
 	if !value.IsKnown() {
-		return nil, fmt.Errorf("cannot convert an unknown cty value to Go")
+		return "${tofuscan_unknown}", nil
 	}
 	if value.IsNull() {
 		return nil, nil

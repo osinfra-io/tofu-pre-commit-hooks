@@ -1426,6 +1426,7 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 		rootVariables string
 		rootLocals    string
 		moduleForEach string
+		moduleCount   string
 		services      string
 		wantViolation bool
 	}{
@@ -1453,10 +1454,35 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			wantViolation: true,
 		},
 		{
-			name:          "unknown module instances with known service input",
+			name:          "unknown module instances do not satisfy existence checks",
 			rootVariables: "variable \"projects\" {\n  type = map(string)\n}\n",
 			moduleForEach: "var.projects",
 			services:      `["cloudasset.googleapis.com"]`,
+			wantViolation: true,
+		},
+		{
+			name:          "single object entry guarantees a module instance",
+			rootVariables: "variable \"project_name\" {\n  type = string\n}\n",
+			rootLocals: `locals {
+  projects = {
+    (var.project_name) = "project"
+  }
+}
+`,
+			moduleForEach: "local.projects",
+			services:      `["cloudasset.googleapis.com"]`,
+		},
+		{
+			name:          "unknown module count does not satisfy existence checks",
+			rootVariables: "variable \"project_count\" {\n  type = number\n}\n",
+			moduleCount:   "var.project_count",
+			services:      `["cloudasset.googleapis.com"]`,
+			wantViolation: true,
+		},
+		{
+			name:        "count index resolves module input",
+			moduleCount: "1",
+			services:    `[["cloudasset.googleapis.com"]][count.index]`,
 		},
 	}
 
@@ -1471,11 +1497,19 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			projectVariables := filepath.Join(projectDir, "variables.tofu")
 			projectMain := filepath.Join(projectDir, "main.tofu")
 
-			rootContent := tt.rootVariables + tt.rootLocals + `module "project" {
+			rootContent := tt.rootVariables + tt.rootLocals + `resource "google_project" "root" {
+  name       = "root-project"
+  project_id = "root-project"
+}
+
+module "project" {
   source = "./project"
 `
 			if tt.moduleForEach != "" {
 				rootContent += "  for_each = " + tt.moduleForEach + "\n"
+			}
+			if tt.moduleCount != "" {
+				rootContent += "  count = " + tt.moduleCount + "\n"
 			}
 			rootContent += "  services = " + tt.services + "\n}\n"
 			projectVariablesContent := `variable "services" {
@@ -1518,6 +1552,134 @@ resource "google_project_service" "this" {
 				t.Fatalf("gcp/cis/2.14 violation: got %t, want %t", violation, tt.wantViolation)
 			}
 		})
+	}
+}
+
+func TestCIS2_14KeepsUnknownAndNullModuleInputsConservative(t *testing.T) {
+	tests := []struct {
+		name          string
+		rootVariables string
+		moduleMode    string
+		childVariable string
+		childServices string
+		wantViolation bool
+	}{
+		{
+			name:          "unknown input cannot select a compliant branch",
+			rootVariables: "variable \"mode\" {\n  type = string\n}\n",
+			moduleMode:    "var.mode",
+			childVariable: "variable \"mode\" {\n  type = string\n}\n",
+			childServices: `var.mode == "disabled" ? [] : ["cloudasset.googleapis.com"]`,
+			wantViolation: true,
+		},
+		{
+			name:          "known null input remains null",
+			moduleMode:    "null",
+			childVariable: "variable \"mode\" {\n  type = string\n}\n",
+			childServices: `var.mode == null ? ["cloudasset.googleapis.com"] : []`,
+		},
+		{
+			name:          "non-nullable null input uses its default",
+			moduleMode:    "null",
+			childVariable: "variable \"mode\" {\n  type     = string\n  default  = \"disabled\"\n  nullable = false\n}\n",
+			childServices: `var.mode == "disabled" ? [] : ["cloudasset.googleapis.com"]`,
+			wantViolation: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectDir := filepath.Join(root, "project")
+			if err := os.Mkdir(projectDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			rootFile := filepath.Join(root, "main.tofu")
+			projectVariables := filepath.Join(projectDir, "variables.tofu")
+			projectLocals := filepath.Join(projectDir, "locals.tofu")
+			projectMain := filepath.Join(projectDir, "main.tofu")
+
+			rootContent := tt.rootVariables + `module "project" {
+  source = "./project"
+  mode   = ` + tt.moduleMode + `
+}
+`
+			projectLocalsContent := `locals {
+  services = ` + tt.childServices + `
+}
+`
+			projectMainContent := `resource "google_project" "this" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_project_service" "this" {
+  for_each = toset(local.services)
+  project  = google_project.this.project_id
+  service  = each.key
+}
+`
+			for path, content := range map[string]string{
+				rootFile:         rootContent,
+				projectVariables: tt.childVariable,
+				projectLocals:    projectLocalsContent,
+				projectMain:      projectMainContent,
+			} {
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			result, err := Run(
+				context.Background(),
+				[]string{rootFile, projectVariables, projectLocals, projectMain},
+				policies.FS,
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var violation bool
+			for _, item := range result.Violations {
+				if item.RuleID == "gcp/cis/2.14" {
+					violation = true
+				}
+			}
+			if violation != tt.wantViolation {
+				t.Fatalf("gcp/cis/2.14 violation: got %t, want %t", violation, tt.wantViolation)
+			}
+		})
+	}
+}
+
+func TestLocalModuleDirectorySupportsAbsoluteSource(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	if err := os.Mkdir(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parentFile := filepath.Join(root, "main.tofu")
+	content := `module "project" {
+  source = "` + projectDir + `"
+}
+`
+	if err := os.WriteFile(parentFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	blocks, err := readModuleBlocks(parentFile)
+	if err != nil {
+		t.Fatalf("read module blocks: %v", err)
+	}
+	symbols := &symbolTable{
+		localValues:    cty.EmptyObjectVal,
+		variableValues: cty.EmptyObjectVal,
+	}
+	got, ok := localModuleDirectory(parentFile, blocks[0], symbols)
+	if !ok {
+		t.Fatal("absolute local source was not recognized")
+	}
+	if got != projectDir {
+		t.Fatalf("module directory: got %q, want %q", got, projectDir)
 	}
 }
 
@@ -1579,6 +1741,7 @@ func TestLocalModuleCallsKeepInputsSeparate(t *testing.T) {
 		rootFile,
 		filepath.ToSlash(filepath.Clean(rootFile)),
 		dirSymbols[filepath.Clean(root)],
+		false,
 		map[string]struct{}{filepath.Clean(root): {}},
 		filesByDir,
 		map[string][]*hclsyntax.Block{rootFile: moduleBlocks},
