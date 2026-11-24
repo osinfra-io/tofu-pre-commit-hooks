@@ -126,8 +126,8 @@ func TestPrintSkippedViolationReason(t *testing.T) {
 		reason string
 		want   string
 	}{
-		{name: "with reason", reason: "Managed by the platform", want: "── [SKIPPED] GKE CIS 5.6.4 · Cluster check\n   └─ Reason: Managed by the platform\n"},
-		{name: "without reason", want: "── [SKIPPED] GKE CIS 5.6.4 · Cluster check\n"},
+		{name: "with reason", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Reason: Managed by the platform\n╰─\n"},
+		{name: "without reason", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n╰─\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			out := captureStdout(t, func() {
@@ -151,11 +151,24 @@ func TestPrintSkippedViolationWrapsReason(t *testing.T) {
 			Title: "Cluster check", SkipReason: reason,
 		})
 	})
-	if !strings.Contains(out, "\n   └─ Reason: ") || !strings.Contains(out, "\n              ") {
-		t.Fatalf("expected an indented, wrapped reason:\n%s", out)
+	if !strings.Contains(out, "\n│  Reason: ") || strings.Count(out, "\n│  ") < 3 {
+		t.Fatalf("expected a wrapped reason in the card:\n%s", out)
 	}
 	if strings.Count(out, "access.") != 8 {
 		t.Fatalf("reason was lost or split:\n%s", out)
+	}
+}
+
+func TestPrintSeparatesSkippedCards(t *testing.T) {
+	skipped := []engine.Violation{
+		{RuleID: "gke/cis/5.6.3", CISControl: "5.6.3", Title: "First"},
+		{RuleID: "gke/cis/5.6.4", CISControl: "5.6.4", Title: "Second"},
+	}
+	out := captureStdout(t, func() {
+		Print(nil, skipped, nil)
+	})
+	if !strings.Contains(out, "╰─\n\n╭─ [SKIPPED] Second") {
+		t.Fatalf("expected blank line between skipped cards:\n%s", out)
 	}
 }
 
