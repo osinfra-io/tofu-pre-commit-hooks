@@ -145,6 +145,34 @@ func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
 	}
 }
 
+func TestPassingCardsIncludeInlineConcatDescriptions(t *testing.T) {
+	resourceTypes := map[string]struct{}{
+		"google_logging_metric": {},
+		"google_project":        {},
+	}
+	out := captureStdout(t, func() {
+		Print(nil, nil, resourceTypes)
+	})
+	normalizedOutput := strings.Join(strings.Fields(strings.ReplaceAll(out, "│", " ")), " ")
+
+	initRuleMetadata()
+	for _, control := range []string{"2.5", "2.6", "2.7", "2.8", "2.9", "2.10", "2.11", "2.12"} {
+		ruleID := "gcp/cis/" + control
+		meta, ok := ruleMetadataMap[ruleID]
+		if !ok {
+			t.Fatalf("metadata missing for %s", ruleID)
+		}
+		if meta.Description == "" {
+			t.Errorf("description missing from metadata for %s", ruleID)
+			continue
+		}
+		description := strings.Join(strings.Fields(meta.Description), " ")
+		if !strings.Contains(normalizedOutput, description) {
+			t.Errorf("passing card output missing description for %s", ruleID)
+		}
+	}
+}
+
 func TestPrint_NoViolationsNoResources(t *testing.T) {
 	// When Print is called with no resource types, we cannot determine
 	// whether rules were evaluated against matching resources or simply
