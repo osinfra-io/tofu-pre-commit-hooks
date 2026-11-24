@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/open-policy-agent/conftest/parser"
 	"github.com/zclconf/go-cty/cty"
 
@@ -1380,6 +1381,7 @@ func TestNormalizeConfigResolvesReferencesAcrossFiles(t *testing.T) {
     channel = var.release_channel
   }
 }
+
 `
 
 	variablesFile := tmp + "/variables.tofu"
@@ -1416,4 +1418,218 @@ func TestNormalizeConfigResolvesReferencesAcrossFiles(t *testing.T) {
 	if got := releaseChannel["channel"]; got != "REGULAR" {
 		t.Fatalf("release_channel.channel across files: got %#v, want %q", got, "REGULAR")
 	}
+}
+
+func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
+	tests := []struct {
+		name          string
+		rootVariables string
+		rootLocals    string
+		services      string
+		wantViolation bool
+	}{
+		{
+			name: "service supplied by caller",
+			rootLocals: `locals {
+  project_services = ["cloudasset.googleapis.com", "monitoring.googleapis.com"]
+}
+`,
+			services: "local.project_services",
+		},
+		{
+			name: "service absent from caller input",
+			rootLocals: `locals {
+  project_services = ["monitoring.googleapis.com"]
+}
+`,
+			services:      "local.project_services",
+			wantViolation: true,
+		},
+		{
+			name:          "unresolved caller input",
+			rootVariables: "variable \"services\" {\n  type = list(string)\n}\n",
+			services:      "var.services",
+			wantViolation: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			projectDir := filepath.Join(root, "project")
+			if err := os.Mkdir(projectDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			rootFile := filepath.Join(root, "main.tofu")
+			projectVariables := filepath.Join(projectDir, "variables.tofu")
+			projectMain := filepath.Join(projectDir, "main.tofu")
+
+			rootContent := tt.rootVariables + tt.rootLocals + `module "project" {
+  source   = "./project"
+  services = ` + tt.services + `
+}
+`
+			projectVariablesContent := `variable "services" {
+  type = list(string)
+}
+`
+			projectMainContent := `resource "google_project" "this" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_project_service" "this" {
+  for_each = toset(var.services)
+  project  = google_project.this.project_id
+  service  = each.key
+}
+`
+
+			for path, content := range map[string]string{
+				rootFile:         rootContent,
+				projectVariables: projectVariablesContent,
+				projectMain:      projectMainContent,
+			} {
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			result, err := Run(context.Background(), []string{rootFile, projectVariables, projectMain}, policies.FS)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var violation bool
+			for _, item := range result.Violations {
+				if item.RuleID == "gcp/cis/2.14" {
+					violation = true
+				}
+			}
+			if violation != tt.wantViolation {
+				t.Fatalf("gcp/cis/2.14 violation: got %t, want %t", violation, tt.wantViolation)
+			}
+		})
+	}
+}
+
+func TestLocalModuleCallsKeepInputsSeparate(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	if err := os.Mkdir(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootFile := filepath.Join(root, "main.tofu")
+	projectFile := filepath.Join(projectDir, "main.tofu")
+	projectVariables := filepath.Join(projectDir, "variables.tofu")
+
+	rootContent := `module "projects" {
+  source = "./project"
+  for_each = {
+    with_asset = {
+      services = ["cloudasset.googleapis.com"]
+    }
+    without_asset = {
+      services = ["monitoring.googleapis.com"]
+    }
+  }
+  services = each.value.services
+}
+`
+	projectVariablesContent := `variable "services" {
+  type = list(string)
+}
+`
+	projectContent := `resource "google_project_service" "this" {
+  for_each = toset(var.services)
+  service  = each.key
+}
+`
+	for path, content := range map[string]string{
+		rootFile:         rootContent,
+		projectFile:      projectContent,
+		projectVariables: projectVariablesContent,
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files := []string{rootFile, projectFile, projectVariables}
+	configs, err := parser.ParseConfigurationsAs(files, "hcl2")
+	if err != nil {
+		t.Fatalf("parse configurations: %v", err)
+	}
+	dirSymbols := buildDirSymbolTables(files)
+	filesByDir := groupFilesByDir(files)
+	moduleBlocks, err := readModuleBlocks(rootFile)
+	if err != nil {
+		t.Fatalf("read module blocks: %v", err)
+	}
+	moduleConfigs := make(map[string]interface{})
+	if err := collectModuleInstanceConfigs(
+		rootFile,
+		filepath.ToSlash(filepath.Clean(rootFile)),
+		dirSymbols[filepath.Clean(root)],
+		map[string]struct{}{filepath.Clean(root): {}},
+		filesByDir,
+		map[string][]*hclsyntax.Block{rootFile: moduleBlocks},
+		configs,
+		moduleConfigs,
+	); err != nil {
+		t.Fatalf("collect module instances: %v", err)
+	}
+
+	servicesByModule := make(map[string][]string)
+	for key, config := range moduleConfigs {
+		serviceNames := moduleServiceNames(config)
+		if len(serviceNames) == 0 {
+			continue
+		}
+		switch {
+		case strings.Contains(key, "[with_asset]"):
+			servicesByModule["with_asset"] = serviceNames
+		case strings.Contains(key, "[without_asset]"):
+			servicesByModule["without_asset"] = serviceNames
+		}
+	}
+	if got := strings.Join(servicesByModule["with_asset"], ","); got != "cloudasset.googleapis.com" {
+		t.Errorf("with_asset services: got %q", got)
+	}
+	if got := strings.Join(servicesByModule["without_asset"], ","); got != "monitoring.googleapis.com" {
+		t.Errorf("without_asset services: got %q", got)
+	}
+}
+
+func moduleServiceNames(config interface{}) []string {
+	configMap, ok := config.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	resources, ok := configMap["resource"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	serviceLabels, ok := resources["google_project_service"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	var services []string
+	for _, entriesValue := range serviceLabels {
+		entries, ok := entriesValue.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, entryValue := range entries {
+			entry, ok := entryValue.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			service, ok := entry["service"].(string)
+			if ok {
+				services = append(services, service)
+			}
+		}
+	}
+	sort.Strings(services)
+	return services
 }
