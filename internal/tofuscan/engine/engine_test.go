@@ -1425,6 +1425,7 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 		name          string
 		rootVariables string
 		rootLocals    string
+		moduleForEach string
 		services      string
 		wantViolation bool
 	}{
@@ -1451,6 +1452,12 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			services:      "var.services",
 			wantViolation: true,
 		},
+		{
+			name:          "unknown module instances with known service input",
+			rootVariables: "variable \"projects\" {\n  type = map(string)\n}\n",
+			moduleForEach: "var.projects",
+			services:      `["cloudasset.googleapis.com"]`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1465,10 +1472,12 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			projectMain := filepath.Join(projectDir, "main.tofu")
 
 			rootContent := tt.rootVariables + tt.rootLocals + `module "project" {
-  source   = "./project"
-  services = ` + tt.services + `
-}
+  source = "./project"
 `
+			if tt.moduleForEach != "" {
+				rootContent += "  for_each = " + tt.moduleForEach + "\n"
+			}
+			rootContent += "  services = " + tt.services + "\n}\n"
 			projectVariablesContent := `variable "services" {
   type = list(string)
 }

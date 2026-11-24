@@ -375,14 +375,10 @@ func collectModuleInstanceConfigs(
 
 		invocations := moduleInvocations(block, parentSymbols)
 		for invocationIndex, invocation := range invocations {
-			var overrides map[string]cty.Value
-			if !invocation.unresolved {
-				overrides = moduleInputOverrides(block, parentSymbols, invocation.each)
-			}
+			overrides := moduleInputOverrides(block, parentSymbols, invocation.each)
 			childSymbols, err := loadSymbolTableFromFilesWithOverrides(
 				filesByDir[childDir],
 				overrides,
-				invocation.unresolved,
 			)
 			if err != nil {
 				return fmt.Errorf("load inputs for module %q: %w", block.Labels[0], err)
@@ -1309,17 +1305,15 @@ func buildDirSymbolTables(files []string) map[string]*symbolTable {
 }
 
 func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
-	return loadSymbolTableFromFilesWithOverrides(files, nil, false)
+	return loadSymbolTableFromFilesWithOverrides(files, nil)
 }
 
 func loadSymbolTableFromFilesWithOverrides(
 	files []string,
 	overrides map[string]cty.Value,
-	unresolvedInputs bool,
 ) (*symbolTable, error) {
 	variables := make(map[string]cty.Value)
 	variableTypes := make(map[string]cty.Type)
-	variableNames := make(map[string]struct{})
 	pending := make(map[string]*hclsyntax.Attribute)
 
 	for _, file := range files {
@@ -1347,7 +1341,6 @@ func loadSymbolTableFromFilesWithOverrides(
 				continue
 			}
 			name := block.Labels[0]
-			variableNames[name] = struct{}{}
 			if typeAttr, ok := block.Body.Attributes["type"]; ok {
 				constraint, typeDiags := typeexpr.TypeConstraint(typeAttr.Expr)
 				if !typeDiags.HasErrors() {
@@ -1366,11 +1359,6 @@ func loadSymbolTableFromFilesWithOverrides(
 		}
 	}
 
-	if unresolvedInputs {
-		for name := range variableNames {
-			variables[name] = unresolvedModuleInput(name)
-		}
-	}
 	for name, value := range overrides {
 		if variableType, ok := variableTypes[name]; ok &&
 			variableType != cty.DynamicPseudoType &&
