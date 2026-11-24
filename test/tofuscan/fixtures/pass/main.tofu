@@ -137,7 +137,7 @@ resource "google_dns_managed_zone" "good_zone" {
   }
 }
 
-# GCP CIS 3.8 — log_config present (VPC flow logs enabled)
+# GCP CIS 3.10 — log_config present (VPC flow logs enabled)
 resource "google_compute_subnetwork" "good_subnet" {
   name          = "good-subnet"
   ip_cidr_range = "10.0.0.0/24"
@@ -147,6 +147,40 @@ resource "google_compute_subnetwork" "good_subnet" {
   log_config {
     aggregation_interval = "INTERVAL_5_SEC"
     flow_sampling        = 0.5
+  }
+}
+
+# GCP CIS 3.3 — DNSSEC configuration via a dynamic block
+resource "google_dns_managed_zone" "dynamic_dnssec_zone" {
+  name     = "dynamic-dnssec-zone"
+  dns_name = "dynamic.example.com."
+
+  dynamic "dnssec_config" {
+    for_each = var.enable_dnssec ? [1] : []
+    content {
+      state = "on"
+
+      default_key_specs {
+        algorithm  = "rsasha256"
+        key_type   = "keySigning"
+        key_length = 2048
+      }
+    }
+  }
+}
+
+# GCP CIS 3.10 — VPC Flow Logs via a dynamic block
+resource "google_compute_subnetwork" "dynamic_log_config_subnet" {
+  name          = "dynamic-log-config-subnet"
+  ip_cidr_range = "10.1.0.0/24"
+  network       = "default"
+  region        = "us-central1"
+
+  dynamic "log_config" {
+    for_each = var.enable_flow_logs ? [1] : []
+    content {
+      aggregation_interval = "INTERVAL_5_SEC"
+    }
   }
 }
 
