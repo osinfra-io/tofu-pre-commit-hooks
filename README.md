@@ -27,6 +27,10 @@ Runs `tofu validate -lint=all` in each directory containing OpenTofu configurati
 
 Unused-local and unused-variable warnings account for shared files: a declaration referenced by any configuration loading the same canonical file is not reported as unused in a partial fixture or shared-file directory. Test assertions in root and default `tests/` test files also count as variable usage in the run's selected module. Unrelated declarations with the same name do not count, and genuinely unused declarations and validation errors remain visible.
 
+This hook performs full validation as well as lint checks. Configure `tofu-lint` instead of both `tofu-validate` and `tofu-lint` to avoid validating every directory twice.
+
+Both hooks check up to four directories concurrently, limited by available CPUs, while keeping initialization serial to protect shared provider caches. Set `args: ["--jobs=1"]` for serial execution, or choose another positive worker count. Initialization remains enabled by default. `args: ["--skip-init"]` skips it only when the caller manages dependency initialization; rerun `tofu init -backend=false` after changing module sources, provider requirements, or lockfiles. Validation alone does not reliably detect stale provider selections.
+
 ### tofu-test
 
 #### Runs OpenTofu automated tests

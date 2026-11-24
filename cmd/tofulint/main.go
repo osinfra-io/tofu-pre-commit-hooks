@@ -11,6 +11,7 @@ import (
 	"tofu-pre-commit-hooks/internal/output"
 	"tofu-pre-commit-hooks/internal/testutil"
 	"tofu-pre-commit-hooks/internal/tofudir"
+	"tofu-pre-commit-hooks/internal/tofurun"
 )
 
 func main() {
@@ -38,6 +39,11 @@ func RunTofuLintCLI(
 	runCmd func(string, []string) (string, error),
 	runLint func(string, []string) (string, error),
 ) error {
+	options, extraArgs, err := tofurun.ParseArgs(extraArgs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
 	if !checkInstalled() {
 		fmt.Println("OpenTofu is not installed or not in PATH.")
 		return fmt.Errorf("OpenTofu not installed")
@@ -80,7 +86,15 @@ func RunTofuLintCLI(
 	var errorMessages []output.TofuMessage
 	var warningMessages []output.TofuMessage
 	baseDir := filepath.Base(rootDir)
-	for _, dir := range dirsWithTofu {
+	lintArgs := append([]string{"validate", "-no-color"}, extraArgs...)
+	lintArgs = append(lintArgs, "-lint=all")
+	results := tofurun.Run(dirsWithTofu, options,
+		func(dir string) (string, error) {
+			return runCmd(dir, []string{"init", "-input=false", "--backend=false"})
+		},
+		func(dir string) (string, error) { return runLint(dir, lintArgs) },
+	)
+	for i, dir := range dirsWithTofu {
 		relPath, err := filepath.Rel(rootDir, dir)
 		if err != nil {
 			relPath = dir
@@ -94,18 +108,12 @@ func RunTofuLintCLI(
 			}
 		}
 
-		out, err := runCmd(dir, []string{"init", "-input=false", "--backend=false"})
-		if err != nil {
-			errorMessages = append(errorMessages, output.TofuMessage{Step: "lint init", RelPath: fullPath, Output: out})
+		result := results[i]
+		if result.InitFailed {
+			errorMessages = append(errorMessages, output.TofuMessage{Step: "lint init", RelPath: fullPath, Output: result.Output})
 			continue
 		}
-
-		lintArgs := append([]string{"validate", "-no-color"}, extraArgs...)
-		lintArgs = append(lintArgs, "-lint=all")
-		out, err = runLint(dir, lintArgs)
-		if err != nil && strings.TrimSpace(out) == "" {
-			out = err.Error()
-		}
+		out, err := result.Output, result.Err
 		if output.HasLintWarning(out) {
 			warningMessages = append(warningMessages, output.TofuMessage{Step: "lint", RelPath: fullPath, Output: out})
 		}
@@ -118,7 +126,10 @@ func RunTofuLintCLI(
 		output.PrintLintWarningSummary(warningMessages)
 	}
 	if len(errorMessages) > 0 {
-		output.PrintErrorSummary(errorMessages)
+		if len(warningMessages) > 0 {
+			fmt.Println()
+		}
+		output.PrintLintErrorSummary(errorMessages)
 		return fmt.Errorf("lint failed")
 	}
 	return nil

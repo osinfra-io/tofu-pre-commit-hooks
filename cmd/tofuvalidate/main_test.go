@@ -206,6 +206,25 @@ func TestRunTofuValidateCLI_AllBranches(t *testing.T) {
 	})
 }
 
+func TestRunTofuValidateCLI_HookOptions(t *testing.T) {
+	err := RunTofuValidateCLI(
+		[]string{"--skip-init", "--jobs=2", "-no-color"},
+		func() bool { return true },
+		func() (string, error) { return "/repo", nil },
+		func(string) []string { return []string{"/repo/a", "/repo/b"} },
+		func(string, []string) (string, error) { t.Error("init ran with --skip-init"); return "", nil },
+		func(_ string, args []string) (string, error) {
+			if strings.Join(args, " ") != "-no-color" {
+				t.Errorf("validation args = %v, want [-no-color]", args)
+			}
+			return "", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestValidOpenTofuConfig tests that a valid config passes validation
 func TestValidOpenTofuConfig(t *testing.T) {
 	testutil.SkipIfTofuNotInstalled(t)

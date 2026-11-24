@@ -3,6 +3,7 @@ module tofu-pre-commit-hooks
 go 1.27.4
 
 require (
+	github.com/charmbracelet/x/ansi v0.11.10
 	github.com/hashicorp/hcl/v2 v2.25.0
 	github.com/open-policy-agent/conftest v0.71.1
 	github.com/open-policy-agent/opa v1.22.4
@@ -24,6 +25,8 @@ require (
 	github.com/basgys/goxml2json v1.1.0 // indirect
 	github.com/bufbuild/protocompile v0.14.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/clipperhouse/displaywidth v0.11.0 // indirect
+	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cockroachdb/apd/v3 v3.2.3 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -47,7 +50,9 @@ require (
 	github.com/lestrrat-go/httprc/v3 v3.0.6 // indirect
 	github.com/lestrrat-go/jwx/v3 v3.4.0 // indirect
 	github.com/lestrrat-go/option/v2 v2.0.0 // indirect
+	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/magiconair/properties v1.18.13 // indirect
+	github.com/mattn/go-runewidth v0.0.27 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/moby/buildkit v0.35.1 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect

@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -34,23 +36,30 @@ type lintDiagnostic struct {
 
 func newLintRunner() func(string, []string) (string, error) {
 	var used map[declaration]bool
+	var indexOnce sync.Once
+	var indexErr error
 	return func(dir string, args []string) (string, error) {
-		if used == nil {
+		indexOnce.Do(func() {
 			root, err := os.Getwd()
 			if err != nil {
-				return "", err
+				indexErr = err
+				return
 			}
 			dirs, err := tofudir.FindDirsWithTofuFiles(root)
 			if err != nil {
-				return "", err
+				indexErr = err
+				return
 			}
 			used, err = referencedDeclarations(dirs)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Shared lint indexing failed; reporting unfiltered lint diagnostics: %v\n", err)
 				used = make(map[declaration]bool)
 			}
+		})
+		if indexErr != nil {
+			return "", indexErr
 		}
-		cmd := exec.Command("tofu", append(args, "-json")...)
+		cmd := exec.Command("tofu", append(slices.Clone(args), "-json")...)
 		cmd.Dir = dir
 		raw, cmdErr := cmd.CombinedOutput()
 		var result struct{ Diagnostics []lintDiagnostic }
