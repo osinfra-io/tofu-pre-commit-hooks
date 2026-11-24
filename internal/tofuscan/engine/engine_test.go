@@ -719,6 +719,23 @@ func TestResourceForEachRejectsUnresolvedMapKeys(t *testing.T) {
 	}
 }
 
+func TestUnwrapSetValuesRecursively(t *testing.T) {
+	input := map[string]interface{}{
+		"resource": []interface{}{
+			map[string]interface{}{
+				"members": setValues{values: []interface{}{"reader"}},
+			},
+		},
+	}
+
+	got := unwrapSetValues(input).(map[string]interface{})
+	resource := got["resource"].([]interface{})[0].(map[string]interface{})
+	members := resource["members"].([]interface{})
+	if len(members) != 1 || members[0] != "reader" {
+		t.Fatalf("members: got %#v, want [reader]", members)
+	}
+}
+
 func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T) {
 	symbols := &symbolTable{
 		localValues:    cty.EmptyObjectVal,
@@ -734,6 +751,327 @@ func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T
 	got := applyResourceEachValue("${each.key}-${each.value.suffix}", instance, symbols)
 	if got != "metric-ownership" {
 		t.Fatalf("mixed template: got %#v, want %q", got, "metric-ownership")
+	}
+}
+
+func TestCIS2_1DynamicAuditLogConfig(t *testing.T) {
+	setContent := `locals {
+  audit_log_config_types = toset(["ADMIN_READ", "DATA_READ", "DATA_WRITE"])
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`
+
+	tests := []struct {
+		name          string
+		content       string
+		wantViolation bool
+	}{
+		{name: "set keys satisfy required types", content: setContent},
+		{
+			name:          "missing required type",
+			content:       strings.Replace(setContent, `, "DATA_WRITE"`, "", 1),
+			wantViolation: true,
+		},
+		{
+			name: "exempted members remain a violation",
+			content: strings.Replace(setContent,
+				`log_type = audit_log_config.key`,
+				`log_type = audit_log_config.key
+      exempted_members = ["user:someone@example.com"]`,
+				1),
+			wantViolation: true,
+		},
+		{
+			name: "unresolved set remains a violation",
+			content: `variable "audit_log_config_types" {
+  type = set(string)
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = var.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+			wantViolation: true,
+		},
+		{
+			name: "declared set variable default uses element keys",
+			content: `variable "audit_log_config_types" {
+  type    = set(string)
+  default = ["ADMIN_READ", "DATA_READ", "DATA_WRITE"]
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = var.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+		},
+		{
+			name: "set nested in resource each value retains member keys",
+			content: `locals {
+  projects = {
+    example = {
+      audit_log_config_types = toset(["ADMIN_READ", "DATA_READ", "DATA_WRITE"])
+    }
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  for_each = local.projects
+  project  = each.key
+  service  = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = each.value.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+		},
+		{
+			name: "map keys with custom iterator",
+			content: `locals {
+  audit_log_config_types = {
+    ADMIN_READ = "first"
+    DATA_READ  = "second"
+    DATA_WRITE = "third"
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    iterator = audit
+    content {
+      log_type = audit.key
+    }
+  }
+}
+`,
+		},
+		{
+			name: "map values with custom iterator",
+			content: `locals {
+  audit_log_config_types = {
+    first  = "ADMIN_READ"
+    second = "DATA_READ"
+    third  = "DATA_WRITE"
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    iterator = audit
+    content {
+      log_type = audit.value
+    }
+  }
+}
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "main.tofu")
+			if err := os.WriteFile(file, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := Run(context.Background(), []string{file}, policies.FS)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var violations int
+			for _, violation := range result.Violations {
+				if violation.RuleID == "gcp/cis/2.1" {
+					violations++
+				}
+			}
+			if got := violations > 0; got != tt.wantViolation {
+				t.Errorf("gcp/cis/2.1 violation: got %t, want %t", got, tt.wantViolation)
+			}
+		})
+	}
+}
+
+func TestCIS5_1NestedSetResourceForEach(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "main.tofu")
+	content := `locals {
+  members = toset(["allUsers"])
+}
+
+resource "google_storage_bucket_iam_binding" "public" {
+  for_each = {
+    one = {
+      members = local.members
+    }
+  }
+
+  bucket  = "example"
+  role    = "roles/storage.objectViewer"
+  members = each.value.members
+}
+`
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Run(context.Background(), []string{file}, policies.FS)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, violation := range result.Violations {
+		if violation.RuleID == "gcp/cis/5.1" {
+			return
+		}
+	}
+	t.Fatal("expected gcp/cis/5.1 violation for nested public IAM member set")
+}
+
+func TestCtyGoConversionPreservesNestedSets(t *testing.T) {
+	nestedSet := cty.SetVal([]cty.Value{cty.StringVal("reader")})
+	value := cty.ObjectVal(map[string]cty.Value{
+		"nested": cty.ObjectVal(map[string]cty.Value{
+			"members": nestedSet,
+		}),
+		"nested_map": cty.MapVal(map[string]cty.Value{
+			"members": nestedSet,
+		}),
+	})
+
+	goValue, err := ctyToGo(value)
+	if err != nil {
+		t.Fatalf("ctyToGo: %v", err)
+	}
+	converted, ok := ctyValueFromGo(goValue)
+	if !ok {
+		t.Fatal("ctyValueFromGo failed")
+	}
+	members := converted.GetAttr("nested").GetAttr("members")
+	if !members.Type().IsSetType() {
+		t.Fatalf("nested members type: got %s, want set", members.Type().FriendlyName())
+	}
+	mapMembers := converted.GetAttr("nested_map").GetAttr("members")
+	if !mapMembers.Type().IsSetType() {
+		t.Fatalf("nested map members type: got %s, want set", mapMembers.Type().FriendlyName())
+	}
+
+	instance := resourceEachInstance{key: cty.StringVal("example"), value: converted}
+	symbols := &symbolTable{localValues: cty.EmptyObjectVal, variableValues: cty.EmptyObjectVal}
+	for _, path := range []string{"nested.members", "nested_map.members"} {
+		resolved := applyResourceEachValue("${each.value."+path+"}", instance, symbols)
+		instances, ok := dynamicForEachInstances(resolved)
+		if !ok || len(instances) != 1 || instances[0].key != "reader" {
+			t.Fatalf("%s dynamic instances: got %#v, want key/value reader", path, instances)
+		}
+	}
+}
+
+func TestCtyGoConversionPreservesSetElementType(t *testing.T) {
+	listType := cty.List(cty.String)
+	nestedSet := cty.SetVal([]cty.Value{
+		cty.ListVal([]cty.Value{cty.StringVal("a")}),
+		cty.ListVal([]cty.Value{cty.StringVal("b"), cty.StringVal("c")}),
+	})
+	value := cty.ObjectVal(map[string]cty.Value{"members": nestedSet})
+	resourceValues := cty.MapVal(map[string]cty.Value{"example": value})
+
+	goValue, err := ctyToGo(resourceValues)
+	if err != nil {
+		t.Fatalf("ctyToGo: %v", err)
+	}
+	instances, ok := resourceForEachInstances(goValue)
+	if !ok || len(instances) != 1 {
+		t.Fatalf("resource for_each instances: got %#v, want one instance", instances)
+	}
+	convertedSet := instances[0].value.GetAttr("members")
+	wantType := cty.Set(listType)
+	if !convertedSet.Type().Equals(wantType) {
+		t.Fatalf("nested set type: got %s, want %s", convertedSet.Type().FriendlyName(), wantType.FriendlyName())
+	}
+	if convertedSet.LengthInt() != 2 {
+		t.Fatalf("nested set length: got %d, want 2", convertedSet.LengthInt())
+	}
+}
+
+func TestExpandDynamicBlocksPreservesShadowedNestedIterator(t *testing.T) {
+	input := map[string]interface{}{
+		"dynamic": map[string]interface{}{
+			"parent": []interface{}{
+				map[string]interface{}{
+					"iterator": "outer",
+					"for_each": []interface{}{
+						map[string]interface{}{
+							"name":     "parent",
+							"children": []interface{}{map[string]interface{}{"name": "child"}},
+						},
+					},
+					"content": []interface{}{
+						map[string]interface{}{
+							"name": "${outer.value.name}",
+							"dynamic": map[string]interface{}{
+								"child": []interface{}{
+									map[string]interface{}{
+										"iterator": "outer",
+										"for_each": "${outer.value.children}",
+										"content": []interface{}{
+											map[string]interface{}{"name": "${outer.value.name}"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := expandDynamicBlocks(input).(map[string]interface{})
+	parent := got["parent"].([]interface{})[0].(map[string]interface{})
+	if parent["name"] != "parent" {
+		t.Fatalf("parent name: got %#v, want parent", parent["name"])
+	}
+	child := parent["child"].([]interface{})[0].(map[string]interface{})
+	if child["name"] != "child" {
+		t.Fatalf("child name: got %#v, want child", child["name"])
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 	"github.com/zclconf/go-cty/cty/function"
 	"github.com/zclconf/go-cty/cty/function/stdlib"
 )
@@ -18,6 +19,7 @@ func hclFunctions() map[string]function.Function {
 		"endswith":   endsWithFn,
 		"merge":      stdlib.MergeFunc,
 		"startswith": startsWithFn,
+		"toset":      toSetFn,
 	}
 }
 
@@ -74,5 +76,49 @@ var concatFn = function.New(&function.Spec{
 			return cty.TupleVal([]cty.Value{}), nil
 		}
 		return cty.TupleVal(elems), nil
+	},
+})
+
+var toSetFn = function.New(&function.Spec{
+	Params: []function.Parameter{
+		{Name: "collection", Type: cty.DynamicPseudoType, AllowDynamicType: true},
+	},
+	Type: function.StaticReturnType(cty.DynamicPseudoType),
+	Impl: func(args []cty.Value, _ cty.Type) (cty.Value, error) {
+		collection := args[0]
+		ty := collection.Type()
+		if ty.IsSetType() {
+			return collection, nil
+		}
+		if !ty.IsListType() && !ty.IsTupleType() {
+			return cty.NilVal, fmt.Errorf("list, tuple, or set required, got %s", ty.FriendlyName())
+		}
+
+		var elements []cty.Value
+		for iterator := collection.ElementIterator(); iterator.Next(); {
+			_, element := iterator.Element()
+			elements = append(elements, element)
+		}
+		if len(elements) == 0 {
+			return cty.SetValEmpty(cty.DynamicPseudoType), nil
+		}
+		types := make([]cty.Type, len(elements))
+		for i, element := range elements {
+			types[i] = element.Type()
+		}
+		elementType, conversions := convert.Unify(types)
+		if elementType == cty.NilType {
+			return cty.NilVal, fmt.Errorf("cannot convert collection elements to one set type")
+		}
+		for i, conversion := range conversions {
+			if conversion != nil {
+				converted, err := conversion(elements[i])
+				if err != nil {
+					return cty.NilVal, err
+				}
+				elements[i] = converted
+			}
+		}
+		return cty.SetVal(elements), nil
 	},
 })
