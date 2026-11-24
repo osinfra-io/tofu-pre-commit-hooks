@@ -126,8 +126,8 @@ func TestPrintSkippedViolationReason(t *testing.T) {
 		reason string
 		want   string
 	}{
-		{name: "with reason", reason: "Managed by the platform", want: "── [SKIPPED] Cluster check · GKE CIS 5.6.4 · Managed by the platform\n"},
-		{name: "without reason", want: "── [SKIPPED] Cluster check · GKE CIS 5.6.4\n"},
+		{name: "with reason", reason: "Managed by the platform", want: "── [SKIPPED] GKE CIS 5.6.4\n   Cluster check\n   Reason: Managed by the platform\n"},
+		{name: "without reason", want: "── [SKIPPED] GKE CIS 5.6.4\n   Cluster check\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			out := captureStdout(t, func() {
@@ -140,6 +140,22 @@ func TestPrintSkippedViolationReason(t *testing.T) {
 				t.Errorf("got %q, want %q", out, tt.want)
 			}
 		})
+	}
+}
+
+func TestPrintSkippedViolationWrapsReason(t *testing.T) {
+	reason := strings.Repeat("Required for authorized access. ", 8)
+	out := captureStdout(t, func() {
+		printSkippedViolation(engine.Violation{
+			RuleID: "gke/cis/5.6.4", CISControl: "5.6.4",
+			Title: "Cluster check", SkipReason: reason,
+		})
+	})
+	if !strings.Contains(out, "\n   Reason: ") || !strings.Contains(out, "\n           ") {
+		t.Fatalf("expected an indented, wrapped reason:\n%s", out)
+	}
+	if strings.Count(out, "access.") != 8 {
+		t.Fatalf("reason was lost or split:\n%s", out)
 	}
 }
 
