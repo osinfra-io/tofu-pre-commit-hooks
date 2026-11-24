@@ -94,7 +94,6 @@ func printLintSummary(messages []TofuMessage, severity, badge, badgeColor, borde
 		}
 	}
 	printed := false
-	width := min(76, max(1, TermWidth()-3))
 	for _, group := range groups {
 		findings := parseLintFindings(group.raw, severity)
 		if severity == "error" && len(findings) == 0 {
@@ -119,9 +118,7 @@ func printLintSummary(messages []TofuMessage, severity, badge, badgeColor, borde
 			}
 			if len(finding.description) > 0 {
 				card.Blank()
-				for _, line := range WrapText(strings.Join(finding.description, " "), width) {
-					card.Line(Colorize(line, Dim))
-				}
+				card.Paragraph(strings.Join(finding.description, " "), Dim)
 			}
 			card.Close()
 		}

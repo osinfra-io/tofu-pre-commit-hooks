@@ -127,7 +127,7 @@ Another error's details.`,
 			step:    "lint",
 			raw:     "Error: Detailed error\n" + strings.Repeat("More detail about this failure. ", 10),
 			want:    []string{"[ERROR]", "Detailed error", "│  More detail"},
-			exclude: []string{strings.Repeat("More detail about this failure. ", 10)},
+			exclude: []string{strings.Repeat("More detail about this failure. ", 10), "│  il\n", "│  s\n"},
 		},
 		{
 			name: "init failure",

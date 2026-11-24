@@ -55,6 +55,13 @@ func (c *Card) Line(text string) {
 	}
 }
 
+// Paragraph wraps descriptive text at word boundaries within the card.
+func (c *Card) Paragraph(text, color string) {
+	for _, line := range WrapText(text, min(76, c.width)) {
+		c.Line(Colorize(line, color))
+	}
+}
+
 // Blank prints an empty separator line within the card.
 func (c *Card) Blank() {
 	fmt.Println(c.border("│"))

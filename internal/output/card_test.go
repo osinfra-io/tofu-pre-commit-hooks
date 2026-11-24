@@ -98,6 +98,7 @@ func TestCardLineWrapsWithinSidebar(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer func() { _ = r.Close() }()
 			oldStdout := os.Stdout
 			os.Stdout = w
@@ -135,5 +136,31 @@ func TestCardLineWrapsWithinSidebar(t *testing.T) {
 				t.Errorf("wrapping changed diagnostic text:\ngot:  %q\nwant: %q", content.String(), want)
 			}
 		})
+	}
+}
+
+func TestCardParagraphWrapsAtWords(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	card := NewCard(Red)
+	card.width = 12
+	card.Paragraph("alpha beta gamma delta", Dim)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	captured, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "│  alpha beta\n│  gamma delta\n"
+	if got := ansi.Strip(string(captured)); got != want {
+		t.Errorf("paragraph output = %q, want %q", got, want)
 	}
 }

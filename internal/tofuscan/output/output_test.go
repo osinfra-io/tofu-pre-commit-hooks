@@ -120,6 +120,31 @@ func TestPrint_MediumViolationUsesWarningBadge(t *testing.T) {
 	}
 }
 
+func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
+	description := strings.Repeat("More detail about this failure. ", 10)
+	for _, tc := range []struct {
+		name  string
+		print func()
+	}{
+		{"violation", func() {
+			printViolation(engine.Violation{Severity: "High", Title: "Failure", Description: description})
+		}},
+		{"passing", func() {
+			printPassingCard(&RuleMetadata{Title: "Success", Description: description})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureStdout(t, tc.print)
+			if strings.Contains(out, "│  il\n") || strings.Contains(out, "│  s\n") {
+				t.Errorf("description was hard-wrapped within a word:\n%s", out)
+			}
+			if strings.Count(out, "failure.") != 10 {
+				t.Errorf("description was lost or split:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestPrint_NoViolationsNoResources(t *testing.T) {
 	// When Print is called with no resource types, we cannot determine
 	// whether rules were evaluated against matching resources or simply
