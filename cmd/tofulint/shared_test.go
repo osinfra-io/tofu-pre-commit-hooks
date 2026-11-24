@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"tofu-pre-commit-hooks/internal/testutil"
@@ -169,8 +170,31 @@ func TestSharedLintPreservesValidationErrors(t *testing.T) {
 	if err := os.WriteFile("main.tofu", []byte(`output "invalid" { value = local.missing }`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
 	out, err := newLintRunner()(root, []string{"validate", "-lint=all"})
 	if err == nil || !strings.Contains(out, "Reference to undeclared local value") {
 		t.Fatalf("validation error was lost: %v\n%s", err, out)
 	}
+}
+
+func TestSharedLintConcurrent(t *testing.T) {
+	testutil.SkipIfTofuNotInstalled(t)
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.WriteFile("main.tofu", []byte(`locals { unused = true }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := newLintRunner()
+	args := make([]string, 2, 4)
+	copy(args, []string{"validate", "-lint=all"})
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Go(func() {
+			out, err := runner(root, args)
+			if err != nil || !strings.Contains(out, `local value "unused"`) {
+				t.Errorf("concurrent lint lost diagnostics: %v\n%s", err, out)
+			}
+		})
+	}
+	workers.Wait()
 }

@@ -13,8 +13,6 @@ import (
 	"tofu-pre-commit-hooks/internal/tofuscan/policies"
 )
 
-const descWrapWidth = 76
-
 // RuleMetadata holds static metadata about a policy rule, parsed from .rego files.
 type RuleMetadata struct {
 	RuleID       string
@@ -194,9 +192,7 @@ func printViolation(v engine.Violation) {
 
 	if v.Description != "" {
 		c.Blank()
-		for _, line := range output.WrapText(v.Description, descWrapWidth) {
-			c.Line(fmt.Sprintf("%s%s%s", output.Dim, line, output.Reset))
-		}
+		c.Paragraph(v.Description, output.Dim)
 	}
 
 	c.Close()
@@ -212,9 +208,7 @@ func printPassingCard(meta *RuleMetadata) {
 
 	if meta.Description != "" {
 		c.Blank()
-		for _, line := range output.WrapText(meta.Description, descWrapWidth) {
-			c.Line(fmt.Sprintf("%s%s%s", output.Dim, line, output.Reset))
-		}
+		c.Paragraph(meta.Description, output.Dim)
 	}
 
 	c.Close()

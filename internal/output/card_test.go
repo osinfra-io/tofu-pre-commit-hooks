@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestCard(t *testing.T) {
@@ -69,5 +71,96 @@ func TestWrapText(t *testing.T) {
 	joined := strings.Join(lines, " ")
 	if joined != text {
 		t.Errorf("WrapText lost content: got %q, want %q", joined, text)
+	}
+}
+
+func TestCardLineWrapsWithinSidebar(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		text       string
+		underlined bool
+		prefix     string
+	}{
+		{
+			name:   "source from validation diagnostic",
+			text:   `│ 43: workspace_valid = can(regex("^us-east[14]-[a-f]-${local.stage}-(sandbox|non-production|production)$", terraform.workspace))`,
+			prefix: "│ ",
+		},
+		{name: "colored nested border", text: "\x1b[31m│\x1b[0m " + strings.Repeat("source ", 20), prefix: "│ "},
+		{name: "long path", text: strings.Repeat("directory/", 15) + "main.tofu:43"},
+		{name: "active ANSI style", text: "\x1b[4m" + strings.Repeat("value ", 20) + "\x1b[0m", underlined: true},
+		{name: "wide graphemes", text: strings.Repeat("界📄👩‍💻e\u0301", 15)},
+		{name: "existing newlines", text: strings.Repeat("first ", 20) + "\n" + strings.Repeat("second ", 20)},
+		{name: "empty", text: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer func() { _ = r.Close() }()
+			oldStdout := os.Stdout
+			os.Stdout = w
+			defer func() { os.Stdout = oldStdout }()
+			card := NewCard(Red)
+			card.width = 31
+			card.Line(tc.text)
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			captured, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var content strings.Builder
+			for i, line := range strings.Split(strings.TrimSuffix(string(captured), "\n"), "\n") {
+				visible := ansi.Strip(line)
+				if !strings.HasPrefix(visible, "│  "+tc.prefix) {
+					t.Errorf("continuation lost its sidebar: %q", line)
+				}
+				if ansi.StringWidth(visible) > card.width+3 {
+					t.Errorf("line overflowed its sidebar: %q", visible)
+				}
+				if tc.underlined && !strings.Contains(line, "\x1b[4m") {
+					t.Errorf("continuation lost its underline: %q", line)
+				}
+				part := strings.TrimPrefix(visible, "│  ")
+				if i > 0 && tc.prefix != "" {
+					part = strings.TrimPrefix(part, tc.prefix)
+				}
+				content.WriteString(part)
+			}
+			want := strings.ReplaceAll(ansi.Strip(tc.text), "\n", "")
+			if content.String() != want {
+				t.Errorf("wrapping changed diagnostic text:\ngot:  %q\nwant: %q", content.String(), want)
+			}
+		})
+	}
+}
+
+func TestCardParagraphWrapsAtWords(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	card := NewCard(Red)
+	card.width = 12
+	card.Paragraph("alpha beta gamma delta", Dim)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	captured, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "│  alpha beta\n│  gamma delta\n"
+	if got := ansi.Strip(string(captured)); got != want {
+		t.Errorf("paragraph output = %q, want %q", got, want)
 	}
 }

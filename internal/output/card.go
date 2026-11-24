@@ -3,6 +3,8 @@ package output
 import (
 	"fmt"
 	"strings"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // Card draws a styled terminal card with box-drawing borders.
@@ -14,11 +16,13 @@ import (
 //	╰─
 type Card struct {
 	color string
+	width int
 }
 
 // NewCard creates a Card with the given border color.
 func NewCard(borderColor string) *Card {
-	return &Card{color: borderColor}
+	// Reserve the sidebar and room for pre-commit's output indentation.
+	return &Card{color: borderColor, width: max(1, TermWidth()-7)}
 }
 
 // Open prints the card header line.
@@ -28,7 +32,34 @@ func (c *Card) Open(badge, title string) {
 
 // Line prints a content line within the card.
 func (c *Card) Line(text string) {
-	fmt.Printf("%s  %s\n", c.border("│"), text)
+	for _, line := range strings.Split(text, "\n") {
+		prefix := ""
+		if visible := ansi.Strip(line); strings.HasPrefix(visible, "│") {
+			prefixWidth := 1
+			if strings.HasPrefix(visible, "│ ") {
+				prefixWidth++
+			}
+			// Keep OpenTofu's nested diagnostic border on continuations too.
+			prefix = ansi.Cut(line, 0, prefixWidth)
+			line = ansi.Cut(line, prefixWidth, ansi.StringWidth(line))
+		}
+		start := 0
+		width := max(1, c.width-ansi.StringWidth(prefix))
+		for _, wrapped := range strings.Split(ansi.Hardwrap(line, width, true), "\n") {
+			end := start + ansi.StringWidth(wrapped)
+			// Reapply the original styles after the sidebar resets its color.
+			content := ansi.Cut(line, start, end)
+			fmt.Printf("%s  %s%s\n", c.border("│"), prefix, content)
+			start = end
+		}
+	}
+}
+
+// Paragraph wraps descriptive text at word boundaries within the card.
+func (c *Card) Paragraph(text, color string) {
+	for _, line := range WrapText(text, min(76, c.width)) {
+		c.Line(Colorize(line, color))
+	}
 }
 
 // Blank prints an empty separator line within the card.

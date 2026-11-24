@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -177,6 +178,61 @@ func TestRunTofuLintCLI_ReportsVersionCommandError(t *testing.T) {
 	}
 }
 
+func TestRunTofuLintCLI_CleanErrorCards(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+	err = RunTofuLintCLI(
+		nil,
+		func() bool { return true },
+		func() (string, error) { return "OpenTofu v1.13.0", nil },
+		func() (string, error) { return "/factory", nil },
+		func(string) ([]string, error) { return []string{"/factory/tofu/runtime/shared"}, nil },
+		func(string, []string) (string, error) { return "", nil },
+		func(string, []string) (string, error) {
+			return `Warning: Experimental linting enabled
+The linting functionality is under active development and may change or break in future releases.
+Warning: Local value not used (core:unused-local)
+  on cluster.tofu line 39:
+Found no usage of the local value "instances".
+Error: Reference to undeclared local value
+  on cluster.tofu line 43:
+A local value with the name "stage" has not been declared.`, errors.New("validation failed")
+		},
+	)
+	if err == nil {
+		t.Error("validation error did not fail the hook")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	captured, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `╭─ [WARNING] Local value not used
+│  📄 factory/tofu/runtime/shared/cluster.tofu:39
+│  🏷  core:unused-local
+│
+│  Found no usage of the local value "instances".
+╰─
+
+╭─ [ERROR] Reference to undeclared local value
+│  📄 factory/tofu/runtime/shared/cluster.tofu:43
+│
+│  A local value with the name "stage" has not been declared.
+╰─
+`
+	if got := string(captured); got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
 func TestTofuLintFixtures(t *testing.T) {
 	testutil.SkipIfTofuNotInstalled(t)
 	versionOutput, err := getOpenTofuVersion()
@@ -275,5 +331,116 @@ func TestRunTofuLintCLI_DirectoryScanError(t *testing.T) {
 	)
 	if !errors.Is(err, scanErr) {
 		t.Errorf("RunTofuLintCLI() error = %v, want wrapped scan error", err)
+	}
+}
+
+func TestRunTofuLintCLI_HookOptions(t *testing.T) {
+	err := RunTofuLintCLI(
+		[]string{"--skip-init", "--jobs", "2", "-var", "message=value"},
+		func() bool { return true },
+		func() (string, error) { return "OpenTofu v1.13.0", nil },
+		func() (string, error) { return "/repo", nil },
+		func(string) ([]string, error) { return []string{"/repo/a", "/repo/b"}, nil },
+		func(string, []string) (string, error) { t.Error("init ran with --skip-init"); return "", nil },
+		func(_ string, args []string) (string, error) {
+			want := "validate -no-color -var message=value -lint=all"
+			if strings.Join(args, " ") != want {
+				t.Errorf("lint args = %v, want %s", args, want)
+			}
+			return "", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLintIncludesValidation(t *testing.T) {
+	testutil.SkipIfTofuNotInstalled(t)
+	for _, tc := range []struct {
+		name    string
+		config  string
+		summary string
+	}{
+		{"syntax", "locals {", "Unclosed configuration block"},
+		{"reference", `output "bad" { value = local.missing }`, "Reference to undeclared local value"},
+		{"provider schema", `resource "terraform_data" "bad" { unexpected = true }`, "Unsupported argument"},
+		{"module", "module \"child\" { source = \"./child\" }\noutput \"bad\" { value = module.child.missing }", "Unsupported attribute"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Chdir(root)
+			if err := os.WriteFile("main.tofu", []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir("child", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile("child/main.tofu", []byte(`output "value" { value = true }`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "module" {
+				if out, err := runCmdInDir(root, []string{"init", "-backend=false"}); err != nil {
+					t.Fatalf("init: %v\n%s", err, out)
+				}
+			}
+			for _, args := range [][]string{{"validate", "-no-color"}, {"validate", "-no-color", "-lint=all"}} {
+				out, err := runCmdInDir(root, args)
+				if err == nil || !strings.Contains(out, tc.summary) {
+					t.Errorf("%v lost validation error: %v\n%s", args, err, out)
+				}
+			}
+			out, err := newLintRunner()(root, []string{"validate", "-lint=all"})
+			if err == nil || !strings.Contains(out, tc.summary) {
+				t.Errorf("lint runner lost validation error: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func BenchmarkTofuLint(b *testing.B) {
+	if !testutil.CheckOpenTofuInstalled() {
+		b.Skip("OpenTofu is not installed")
+	}
+	for _, scenario := range []struct {
+		name        string
+		directories int
+		values      int
+	}{
+		{"many-directories", 32, 16},
+		{"large-files", 4, 10000},
+	} {
+		for _, jobs := range []int{1, 4} {
+			b.Run(fmt.Sprintf("%s/jobs=%d", scenario.name, jobs), func(b *testing.B) {
+				root := b.TempDir()
+				b.Chdir(root)
+				content := "locals {\nvalues = [\n" + strings.Repeat("\"value\",\n", scenario.values) +
+					"]\n}\noutput \"values\" { value = local.values }\n"
+				for i := range scenario.directories {
+					dir := filepath.Join(root, fmt.Sprintf("module-%03d", i))
+					if err := os.Mkdir(dir, 0o755); err != nil {
+						b.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(dir, "main.tofu"), []byte(content), 0o644); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ResetTimer()
+				for b.Loop() {
+					err := RunTofuLintCLI(
+						[]string{"--skip-init", fmt.Sprintf("--jobs=%d", jobs)},
+						testutil.CheckOpenTofuInstalled,
+						getOpenTofuVersion,
+						os.Getwd,
+						tofudir.FindDirsWithTofuFiles,
+						runCmdInDir,
+						newLintRunner(),
+					)
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
 	}
 }

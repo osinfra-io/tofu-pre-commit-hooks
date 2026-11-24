@@ -10,18 +10,12 @@ import (
 	"tofu-pre-commit-hooks/internal/output"
 	"tofu-pre-commit-hooks/internal/testutil"
 	"tofu-pre-commit-hooks/internal/tofudir"
+	"tofu-pre-commit-hooks/internal/tofurun"
 )
 
 func main() {
-	// Only pass flags (arguments starting with '-') to tofu commands
-	extraArgs := []string{}
-	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "-") {
-			extraArgs = append(extraArgs, arg)
-		}
-	}
 	err := RunTofuValidateCLI(
-		extraArgs,
+		os.Args[1:],
 		testutil.CheckOpenTofuInstalled,
 		os.Getwd,
 		findDirsWithTfFiles,
@@ -42,6 +36,11 @@ func RunTofuValidateCLI(
 	runCmd func(string, []string) (string, error),
 	runValidate func(string, []string) (string, error),
 ) error {
+	options, extraArgs, err := tofurun.ParseArgs(extraArgs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
 	if !checkInstalled() {
 		fmt.Println("OpenTofu is not installed or not in PATH.")
 		return fmt.Errorf("OpenTofu not installed")
@@ -62,7 +61,14 @@ func RunTofuValidateCLI(
 	var errorMessages []output.TofuMessage
 	var warningMessages []output.TofuMessage
 	baseDir := filepath.Base(rootDir)
-	for _, dir := range dirsWithTf {
+	results := tofurun.Run(dirsWithTf, options,
+		func(dir string) (string, error) {
+			args := append([]string{"init", "-input=false", "--backend=false"}, extraArgs...)
+			return runCmd(dir, args)
+		},
+		func(dir string) (string, error) { return runValidate(dir, extraArgs) },
+	)
+	for i, dir := range dirsWithTf {
 		relPath, err := filepath.Rel(rootDir, dir)
 		if err != nil {
 			relPath = dir // fallback to absolute path
@@ -76,15 +82,12 @@ func RunTofuValidateCLI(
 		} else {
 			fullPath = baseDir + "/" + relPath
 		}
-		initCmd := []string{"init", "-input=false", "--backend=false"}
-		cmdArgs := append(initCmd, extraArgs...)
-		out, err := runCmd(dir, cmdArgs)
-		if err != nil {
-			errorMessages = append(errorMessages, output.TofuMessage{Step: "init", RelPath: fullPath, Output: out})
+		result := results[i]
+		if result.InitFailed {
+			errorMessages = append(errorMessages, output.TofuMessage{Step: "init", RelPath: fullPath, Output: result.Output})
 			continue
 		}
-
-		out, err = runValidate(dir, extraArgs)
+		out, err := result.Output, result.Err
 		// Always check for warnings in validate output
 		if output.HasWarning(out) {
 			warningMessages = append(warningMessages, output.TofuMessage{Step: "validate", RelPath: fullPath, Output: out})
