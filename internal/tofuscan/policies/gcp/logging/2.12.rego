@@ -21,7 +21,7 @@ _violation_2_12 := {
 _has_sql_metric_with_alert if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), "cloudsql.instances.update")
+	lib.metric_filter_contains(resource, "cloudsql.instances.update")
 	metric_name := object.get(resource, "name", "")
 	count(metric_name) > 0
 	lib.alert_exists_for_metric(metric_name)

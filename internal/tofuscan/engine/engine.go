@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -34,8 +35,10 @@ type Violation struct {
 }
 
 type symbolTable struct {
-	locals    map[string]interface{}
-	variables map[string]interface{}
+	locals         map[string]interface{}
+	variables      map[string]interface{}
+	localValues    cty.Value
+	variableValues cty.Value
 }
 
 // RunResult holds the output of a policy evaluation run.
@@ -292,7 +295,276 @@ func normalizeConfig(file string, config interface{}, dirSymbols map[string]*sym
 	}
 
 	resolved := resolveReferences(config, symbols)
-	return expandDynamicBlocks(resolved)
+	return expandDynamicBlocks(expandResourceForEach(resolved, symbols))
+}
+
+type resourceEachInstance struct {
+	key   cty.Value
+	value cty.Value
+}
+
+// expandResourceForEach materialises resource-level for_each blocks when their
+// collections have been resolved to a concrete map or list. Unresolved blocks
+// are kept unchanged so policies cannot mistake them for known configuration.
+func expandResourceForEach(value interface{}, symbols *symbolTable) interface{} {
+	config, ok := value.(map[string]interface{})
+	if !ok {
+		return value
+	}
+	resources, ok := config["resource"].(map[string]interface{})
+	if !ok {
+		return value
+	}
+
+	expandedResources := make(map[string]interface{}, len(resources))
+	for resourceType, resourceLabelsValue := range resources {
+		resourceLabels, ok := resourceLabelsValue.(map[string]interface{})
+		if !ok {
+			expandedResources[resourceType] = resourceLabelsValue
+			continue
+		}
+
+		expandedLabels := make(map[string]interface{}, len(resourceLabels))
+		for label, entriesValue := range resourceLabels {
+			entries, ok := entriesValue.([]interface{})
+			if !ok {
+				expandedLabels[label] = entriesValue
+				continue
+			}
+
+			expandedEntries := make([]interface{}, 0, len(entries))
+			for _, entryValue := range entries {
+				entry, ok := entryValue.(map[string]interface{})
+				if !ok {
+					expandedEntries = append(expandedEntries, entryValue)
+					continue
+				}
+				forEach, hasForEach := entry["for_each"]
+				instances, resolvable := resourceForEachInstances(forEach)
+				if !hasForEach || !resolvable {
+					expandedEntries = append(expandedEntries, entryValue)
+					continue
+				}
+
+				for _, instance := range instances {
+					materialized := make(map[string]interface{}, len(entry)-1)
+					for key, attr := range entry {
+						if key != "for_each" {
+							materialized[key] = attr
+						}
+					}
+					expandedEntries = append(expandedEntries, applyResourceEachValue(materialized, instance, symbols))
+				}
+			}
+			expandedLabels[label] = expandedEntries
+		}
+		expandedResources[resourceType] = expandedLabels
+	}
+
+	normalized := make(map[string]interface{}, len(config))
+	for key, item := range config {
+		if key == "resource" {
+			normalized[key] = expandedResources
+		} else {
+			normalized[key] = item
+		}
+	}
+	return normalized
+}
+
+func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			if hasUnresolvedExpression(key) || hasUnresolvedExpression(typed[key]) {
+				return nil, false
+			}
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		instances := make([]resourceEachInstance, 0, len(keys))
+		for _, key := range keys {
+			item, ok := ctyValueFromGo(typed[key])
+			if !ok {
+				return nil, false
+			}
+			instances = append(instances, resourceEachInstance{
+				key:   cty.StringVal(key),
+				value: item,
+			})
+		}
+		return instances, true
+
+	case []interface{}:
+		values := make(map[string]struct{}, len(typed))
+		for _, item := range typed {
+			stringValue, ok := item.(string)
+			if !ok || hasUnresolvedExpression(stringValue) {
+				return nil, false
+			}
+			values[stringValue] = struct{}{}
+		}
+
+		keys := make([]string, 0, len(values))
+		for value := range values {
+			keys = append(keys, value)
+		}
+		sort.Strings(keys)
+
+		instances := make([]resourceEachInstance, 0, len(keys))
+		for _, value := range keys {
+			item := cty.StringVal(value)
+			instances = append(instances, resourceEachInstance{key: item, value: item})
+		}
+		return instances, true
+
+	default:
+		return nil, false
+	}
+}
+
+func hasUnresolvedExpression(value interface{}) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.Contains(typed, "${")
+	case []interface{}:
+		for _, item := range typed {
+			if hasUnresolvedExpression(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for key, item := range typed {
+			if hasUnresolvedExpression(key) || hasUnresolvedExpression(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ctyValueFromGo(value interface{}) (cty.Value, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return cty.NilVal, false
+	}
+	valueType, err := ctyjson.ImpliedType(encoded)
+	if err != nil {
+		return cty.NilVal, false
+	}
+	converted, err := ctyjson.Unmarshal(encoded, valueType)
+	if err != nil {
+		return cty.NilVal, false
+	}
+	return converted, true
+}
+
+func applyResourceEachValue(value interface{}, instance resourceEachInstance, symbols *symbolTable) interface{} {
+	switch typed := value.(type) {
+	case []interface{}:
+		resolved := make([]interface{}, len(typed))
+		for i, item := range typed {
+			resolved[i] = applyResourceEachValue(item, instance, symbols)
+		}
+		return resolved
+	case map[string]interface{}:
+		resolved := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			if key == "dynamic" {
+				resolved[key] = applyResourceEachDynamicBlocks(item, instance, symbols)
+			} else {
+				resolved[key] = applyResourceEachValue(item, instance, symbols)
+			}
+		}
+		return resolved
+	case string:
+		if !strings.Contains(typed, "${") {
+			return typed
+		}
+
+		ctx := &hcl.EvalContext{
+			Functions: hclFunctions(),
+			Variables: map[string]cty.Value{
+				"each": cty.ObjectVal(map[string]cty.Value{
+					"key":   instance.key,
+					"value": instance.value,
+				}),
+				"local": symbols.localValues,
+				"var":   symbols.variableValues,
+			},
+		}
+
+		if strings.HasPrefix(typed, "${") && strings.HasSuffix(typed, "}") {
+			expr := strings.TrimSuffix(strings.TrimPrefix(typed, "${"), "}")
+			parsed, diags := hclsyntax.ParseExpression([]byte(expr), "<tofuscan>", hcl.Pos{Line: 1, Column: 1})
+			if !diags.HasErrors() {
+				resolved, diags := parsed.Value(ctx)
+				if !diags.HasErrors() && resolved.IsKnown() && !resolved.IsNull() {
+					goValue, err := ctyToGo(resolved)
+					if err == nil {
+						return goValue
+					}
+				}
+			}
+		}
+
+		template, diags := hclsyntax.ParseTemplate([]byte(typed), "<tofuscan>", hcl.Pos{Line: 1, Column: 1})
+		if diags.HasErrors() {
+			return typed
+		}
+		resolved, diags := template.Value(ctx)
+		if diags.HasErrors() || !resolved.IsKnown() || resolved.IsNull() || resolved.Type() != cty.String {
+			return typed
+		}
+		return resolved.AsString()
+	default:
+		return value
+	}
+}
+
+func applyResourceEachDynamicBlocks(value interface{}, instance resourceEachInstance, symbols *symbolTable) interface{} {
+	dynamicBlocks, ok := value.(map[string]interface{})
+	if !ok {
+		return applyResourceEachValue(value, instance, symbols)
+	}
+
+	resolved := make(map[string]interface{}, len(dynamicBlocks))
+	for blockName, entriesValue := range dynamicBlocks {
+		entries, ok := entriesValue.([]interface{})
+		if !ok {
+			resolved[blockName] = applyResourceEachValue(entriesValue, instance, symbols)
+			continue
+		}
+
+		resolvedEntries := make([]interface{}, len(entries))
+		for i, entryValue := range entries {
+			entry, ok := entryValue.(map[string]interface{})
+			if !ok {
+				resolvedEntries[i] = applyResourceEachValue(entryValue, instance, symbols)
+				continue
+			}
+
+			iterator := blockName
+			if name, ok := entry["iterator"].(string); ok && name != "" {
+				iterator = strings.TrimSuffix(strings.TrimPrefix(name, "${"), "}")
+			}
+			resolvedEntry := make(map[string]interface{}, len(entry))
+			for key, item := range entry {
+				if key == "iterator" {
+					resolvedEntry[key] = iterator
+				} else if key == "content" && iterator == "each" {
+					resolvedEntry[key] = item
+				} else {
+					resolvedEntry[key] = applyResourceEachValue(item, instance, symbols)
+				}
+			}
+			resolvedEntries[i] = resolvedEntry
+		}
+		resolved[blockName] = resolvedEntries
+	}
+	return resolved
 }
 
 // expandDynamicBlocks recursively expands HCL dynamic blocks where for_each
@@ -519,8 +791,10 @@ func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
 	}
 
 	return &symbolTable{
-		locals:    localValues,
-		variables: variableValues,
+		locals:         localValues,
+		variables:      variableValues,
+		localValues:    ctyObject(locals),
+		variableValues: ctyObject(variables),
 	}, nil
 }
 

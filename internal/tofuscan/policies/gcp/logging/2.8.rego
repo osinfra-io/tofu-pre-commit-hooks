@@ -20,7 +20,7 @@ _violation_2_8 := {
 _has_firewall_metric_with_alert if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), "gce_firewall_rule")
+	lib.metric_filter_contains(resource, "gce_firewall_rule")
 	metric_name := object.get(resource, "name", "")
 	count(metric_name) > 0
 	lib.alert_exists_for_metric(metric_name)

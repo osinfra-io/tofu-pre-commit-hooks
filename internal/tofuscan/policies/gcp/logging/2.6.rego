@@ -20,7 +20,7 @@ _violation_2_6 := {
 _has_audit_config_metric_with_alert if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), "auditConfigDeltas")
+	lib.metric_filter_contains(resource, "auditConfigDeltas")
 	metric_name := object.get(resource, "name", "")
 	count(metric_name) > 0
 	lib.alert_exists_for_metric(metric_name)

@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/open-policy-agent/conftest/parser"
+	"github.com/zclconf/go-cty/cty"
 
 	"tofu-pre-commit-hooks/internal/tofuscan/policies"
 )
@@ -312,9 +314,9 @@ resource "google_compute_instance" "vm2" {
 	index := resourceLineIndex(f)
 
 	cases := map[string]int{
-		"google_compute_instance.vm1":    1,
-		"google_storage_bucket.bucket":   5,
-		"google_compute_instance.vm2":    12,
+		"google_compute_instance.vm1":  1,
+		"google_storage_bucket.bucket": 5,
+		"google_compute_instance.vm2":  12,
 	}
 	for name, wantLine := range cases {
 		if gotLine := index[name]; gotLine != wantLine {
@@ -361,7 +363,6 @@ resource "google_storage_bucket" "this" {
 		t.Errorf("google_storage_bucket.this: got line %d, want 5", got)
 	}
 }
-
 
 func TestGlobalViolationFiresOnceAcrossFiles(t *testing.T) {
 	// When scanning multiple files where none defines a log sink,
@@ -697,9 +698,335 @@ func TestExpandDynamicBlocksUnresolvedPreserved(t *testing.T) {
 	}
 }
 
+func TestResourceForEachRejectsUnresolvedMapKeys(t *testing.T) {
+	tests := map[string]interface{}{
+		"root key": map[string]interface{}{
+			"${var.metric_name}": "roles/owner",
+		},
+		"nested key": map[string]interface{}{
+			"ownership": map[string]interface{}{
+				"${var.metric_name}": "roles/owner",
+			},
+		},
+	}
+
+	for name, collection := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, resolvable := resourceForEachInstances(collection); resolvable {
+				t.Fatal("collection with an unresolved map key was expanded")
+			}
+		})
+	}
+}
+
+func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T) {
+	symbols := &symbolTable{
+		localValues:    cty.EmptyObjectVal,
+		variableValues: cty.EmptyObjectVal,
+	}
+	instance := resourceEachInstance{
+		key: cty.StringVal("metric"),
+		value: cty.ObjectVal(map[string]cty.Value{
+			"suffix": cty.StringVal("ownership"),
+		}),
+	}
+
+	got := applyResourceEachValue("${each.key}-${each.value.suffix}", instance, symbols)
+	if got != "metric-ownership" {
+		t.Fatalf("mixed template: got %#v, want %q", got, "metric-ownership")
+	}
+}
+
+func TestResourceForEachLogMetricsAndAlerts(t *testing.T) {
+	content := `variable "enable_owner" {
+  type = bool
+}
+
+locals {
+  metrics = {
+    ownership  = "protoPayload.serviceData.policyDelta.bindingDeltas.role=\"roles/owner\""
+    audit      = "protoPayload.serviceData.policyDelta.auditConfigDeltas:*"
+    custom     = "iam_role"
+    firewall   = "gce_firewall_rule"
+    route      = "gce_route"
+    network    = "gce_network"
+    storage    = "storage.setIamPermissions"
+    sql        = "cloudsql.instances.update"
+  }
+  alert_filters = {
+    for key, filter in local.metrics :
+    key => "metric.type=\"logging.googleapis.com/user/${key}-${filter}\" AND resource.type=\"global\""
+  }
+  without_ownership = {
+    for key, filter in local.metrics : key => filter if key != "ownership"
+  }
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = local.metrics
+
+  name    = "${each.key}-${each.value}"
+  filter  = each.value
+  project = google_project.example.project_id
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.metrics
+
+  combiner     = "OR"
+  display_name = each.key
+  project      = google_project.example.project_id
+
+  conditions {
+    display_name = google_logging_metric.cis[each.key].name
+    condition_threshold {
+      comparison = "COMPARISON_GT"
+      duration   = "0s"
+      filter     = local.alert_filters[each.key]
+    }
+  }
+}
+`
+
+	tests := []struct {
+		name        string
+		content     string
+		wantRuleIDs []string
+	}{
+		{name: "all metric and alert instances match", content: content},
+		{
+			name: "missing metric",
+			content: strings.Replace(content,
+				`resource "google_logging_metric" "cis" {
+  for_each = local.metrics`,
+				`resource "google_logging_metric" "cis" {
+  for_each = local.without_ownership`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name: "missing alert",
+			content: strings.Replace(content,
+				`resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.metrics`,
+				`resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.without_ownership`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name:        "mismatched alert filter",
+			content:     strings.Replace(content, `user/${key}-${filter}`, `user/not-${key}-${filter}`, 1),
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved value in known collection",
+			content: `variable "filter" {
+  type = string
+}
+
+locals {
+  alert_filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = { ownership = var.filter }
+  name     = each.key
+  filter   = each.value != "" ? "roles/owner" : "unrelated"
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = { ownership = "alert" }
+  conditions {
+    condition_threshold {
+      filter = local.alert_filter
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved key in collection",
+			content: `variable "metric_name" {
+  type = string
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = { (var.metric_name) = "roles/owner" }
+  name     = each.key != "" ? "ownership" : "other"
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = { ownership = "alert" }
+  conditions {
+    condition_threshold {
+      filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved metric filter",
+			content: strings.Replace(content,
+				`filter  = each.value`,
+				`filter  = each.key == "ownership" ? (var.enable_owner ? "roles/owner" : each.value) : each.value`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name: "dynamic block iterator shadows resource each",
+			content: `locals {
+  metrics = {
+    ownership = "roles/owner"
+  }
+  alerts = {
+    ownership = {
+      filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+    }
+  }
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = local.metrics
+  name     = each.key
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.alerts
+  conditions {
+    dynamic "condition_threshold" {
+      for_each = [{ filter = "metric.type=\"logging.googleapis.com/user/mismatched\""}]
+      iterator = each
+      content {
+        filter = each.value.filter
+      }
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "string set for_each",
+			content: `variable "metrics" {
+  type    = set(string)
+  default = ["roles/owner", "auditConfigDeltas", "iam_role", "gce_firewall_rule", "gce_route", "gce_network", "storage.setIamPermissions", "cloudsql.instances.update"]
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = var.metrics
+  name     = each.key
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = var.metrics
+  conditions {
+    condition_threshold {
+      filter = "metric.type=\"logging.googleapis.com/user/${each.key}\""
+    }
+  }
+}
+`,
+		},
+		{
+			name: "unresolved resource for_each",
+			content: `variable "metrics" {
+  type = map(string)
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = var.metrics
+  name     = each.key
+  filter   = each.value
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+	}
+	rulesUnderTest := map[string]struct{}{
+		"gcp/cis/2.5":  {},
+		"gcp/cis/2.6":  {},
+		"gcp/cis/2.7":  {},
+		"gcp/cis/2.8":  {},
+		"gcp/cis/2.9":  {},
+		"gcp/cis/2.10": {},
+		"gcp/cis/2.11": {},
+		"gcp/cis/2.12": {},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			file := filepath.Join(tmp, "main.tofu")
+			if err := os.WriteFile(file, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := Run(context.Background(), []string{file}, policies.FS)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var got []string
+			for _, violation := range result.Violations {
+				if _, ok := rulesUnderTest[violation.RuleID]; ok {
+					got = append(got, violation.RuleID)
+				}
+			}
+			sort.Strings(got)
+			want := append([]string(nil), tt.wantRuleIDs...)
+			sort.Strings(want)
+			if len(got) != len(want) {
+				t.Fatalf("CIS 2.5–2.12 violations: got %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("CIS 2.5–2.12 violations: got %v, want %v", got, want)
+					break
+				}
+			}
+		})
+	}
+}
+
 func TestNormalizeConfigResolvesReferencesAcrossFiles(t *testing.T) {
 	tmp := t.TempDir()
-
 	variables := `variable "release_channel" {
   default = "REGULAR"
 }
