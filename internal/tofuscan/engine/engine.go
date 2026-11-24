@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,10 +38,11 @@ type Violation struct {
 }
 
 type symbolTable struct {
-	locals         map[string]interface{}
-	variables      map[string]interface{}
-	localValues    cty.Value
-	variableValues cty.Value
+	locals           map[string]interface{}
+	variables        map[string]interface{}
+	localExpressions map[string]*hclsyntax.Attribute
+	localValues      cty.Value
+	variableValues   cty.Value
 }
 
 // RunResult holds the output of a policy evaluation run.
@@ -60,10 +62,46 @@ func Run(ctx context.Context, files []string, policiesFS fs.FS) (*RunResult, err
 	// definitions in any file (e.g. variables.tofu, locals.tofu) are visible
 	// when resolving references in resource files (e.g. main.tofu).
 	dirSymbols := buildDirSymbolTables(files)
+	filesByDir := groupFilesByDir(files)
+	moduleBlocksByFile := make(map[string][]*hclsyntax.Block, len(files))
+	for _, file := range files {
+		blocks, err := readModuleBlocks(file)
+		if err != nil {
+			return nil, fmt.Errorf("read module calls in %s: %w", file, err)
+		}
+		moduleBlocksByFile[file] = blocks
+	}
+
+	// Global existence checks need each local child module evaluated in its
+	// caller's context. Resource-specific checks retain the normal per-file
+	// evaluation, and global checks continue to use one merged input.
+	moduleDirs := referencedLocalModuleDirs(files, filesByDir, moduleBlocksByFile, dirSymbols)
 
 	normalizedConfigs := make(map[string]interface{}, len(configs))
+	moduleConfigs := make(map[string]interface{})
 	for file, config := range configs {
-		normalizedConfigs[file] = normalizeConfig(file, config, dirSymbols)
+		dir := filepath.Clean(filepath.Dir(file))
+		symbols := dirSymbols[dir]
+		normalizedConfigs[file] = normalizeConfigWithSymbols(config, symbols)
+
+		if _, isModuleDirectory := moduleDirs[dir]; isModuleDirectory {
+			continue
+		}
+
+		stack := map[string]struct{}{filepath.Clean(filepath.Dir(file)): {}}
+		if err := collectModuleInstanceConfigs(
+			file,
+			filepath.ToSlash(filepath.Clean(file)),
+			symbols,
+			false,
+			stack,
+			filesByDir,
+			moduleBlocksByFile,
+			configs,
+			moduleConfigs,
+		); err != nil {
+			return nil, fmt.Errorf("resolve local modules from %s: %w", file, err)
+		}
 	}
 
 	compiler, err := loadCompiler(policiesFS)
@@ -103,7 +141,16 @@ func Run(ctx context.Context, files []string, policiesFS fs.FS) (*RunResult, err
 	// resource in one module (e.g. a log sink) therefore suppresses a global
 	// violation for every other module in the same run. Scan one project
 	// directory at a time if per-project isolation is required.
-	merged := mergeConfigs(normalizedConfigs)
+	globalConfigs := make(map[string]interface{}, len(normalizedConfigs)+len(moduleConfigs))
+	for file, config := range normalizedConfigs {
+		if _, isModuleDirectory := moduleDirs[filepath.Clean(filepath.Dir(file))]; !isModuleDirectory {
+			globalConfigs[file] = config
+		}
+	}
+	for file, config := range moduleConfigs {
+		globalConfigs[file] = config
+	}
+	merged := mergeConfigs(globalConfigs)
 	globalViolations, err := evaluate(ctx, "", merged, prepared)
 	if err != nil {
 		return nil, fmt.Errorf("evaluate merged config: %w", err)
@@ -118,6 +165,442 @@ func Run(ctx context.Context, files []string, policiesFS fs.FS) (*RunResult, err
 		Violations:    violations,
 		ResourceTypes: extractResourceTypes(normalizedConfigs),
 	}, nil
+}
+
+type moduleInvocation struct {
+	each          *resourceEachInstance
+	countIndex    cty.Value
+	hasCountIndex bool
+	key           string
+	unresolved    bool
+}
+
+func groupFilesByDir(files []string) map[string][]string {
+	filesByDir := make(map[string][]string)
+	for _, file := range files {
+		dir := filepath.Clean(filepath.Dir(file))
+		filesByDir[dir] = append(filesByDir[dir], file)
+	}
+	for dir := range filesByDir {
+		sort.Strings(filesByDir[dir])
+	}
+	return filesByDir
+}
+
+func readModuleBlocks(file string) ([]*hclsyntax.Block, error) {
+	source, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	parsed, diags := hclsyntax.ParseConfig(source, file, hcl.Pos{Line: 1, Column: 1})
+	if diags.HasErrors() {
+		return nil, fmt.Errorf("parse HCL: %s", diags.Error())
+	}
+	body, ok := parsed.Body.(*hclsyntax.Body)
+	if !ok {
+		return nil, nil
+	}
+
+	var blocks []*hclsyntax.Block
+	for _, block := range body.Blocks {
+		if block.Type == "module" && len(block.Labels) == 1 {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks, nil
+}
+
+func referencedLocalModuleDirs(
+	files []string,
+	filesByDir map[string][]string,
+	moduleBlocksByFile map[string][]*hclsyntax.Block,
+	dirSymbols map[string]*symbolTable,
+) map[string]struct{} {
+	directories := make(map[string]struct{})
+	for _, file := range files {
+		symbols := dirSymbols[filepath.Clean(filepath.Dir(file))]
+		if symbols == nil {
+			continue
+		}
+		for _, block := range moduleBlocksByFile[file] {
+			dir, ok := localModuleDirectory(file, block, symbols)
+			if ok && len(filesByDir[dir]) > 0 {
+				directories[dir] = struct{}{}
+			}
+		}
+	}
+	return directories
+}
+
+func localModuleDirectory(file string, block *hclsyntax.Block, symbols *symbolTable) (string, bool) {
+	sourceAttr, ok := block.Body.Attributes["source"]
+	if !ok {
+		return "", false
+	}
+	sourceValue, ok := evaluateHCLExpression(sourceAttr.Expr, symbols, nil)
+	if !ok || sourceValue.Type() != cty.String {
+		return "", false
+	}
+	source := sourceValue.AsString()
+	if !filepath.IsAbs(source) && !strings.HasPrefix(source, "./") && !strings.HasPrefix(source, "../") {
+		return "", false
+	}
+	if strings.Contains(source, "://") || strings.HasPrefix(source, "git::") {
+		return "", false
+	}
+	if path, subdirectory, hasSubdirectory := strings.Cut(source, "//"); hasSubdirectory {
+		source = filepath.Join(path, subdirectory)
+	}
+	if filepath.IsAbs(source) {
+		return filepath.Clean(source), true
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), source)), true
+}
+
+func evaluateHCLExpression(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+	each *resourceEachInstance,
+	countIndex ...cty.Value,
+) (cty.Value, bool) {
+	value, ok := evaluateHCLExpressionValue(expression, symbols, each, countIndex...)
+	if !ok || !value.IsKnown() {
+		return cty.NilVal, false
+	}
+	return value, true
+}
+
+func evaluateHCLExpressionValue(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+	each *resourceEachInstance,
+	countIndex ...cty.Value,
+) (cty.Value, bool) {
+	if symbols == nil {
+		return cty.NilVal, false
+	}
+
+	variables := map[string]cty.Value{
+		"local": symbols.localValues,
+		"var":   symbols.variableValues,
+	}
+	if each != nil {
+		variables["each"] = cty.ObjectVal(map[string]cty.Value{
+			"key":   each.key,
+			"value": each.value,
+		})
+	}
+	if len(countIndex) > 0 {
+		variables["count"] = cty.ObjectVal(map[string]cty.Value{
+			"index": countIndex[0],
+		})
+	}
+	value, diags := expression.Value(&hcl.EvalContext{
+		Functions: hclFunctions(),
+		Variables: variables,
+	})
+	if diags.HasErrors() {
+		return cty.NilVal, false
+	}
+	return value, true
+}
+
+func singleObjectModuleInvocation(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+) (moduleInvocation, bool) {
+	object, ok := moduleForEachObjectExpression(expression, symbols, make(map[string]struct{}))
+	if !ok || len(object.Items) != 1 {
+		return moduleInvocation{}, false
+	}
+
+	item := object.Items[0]
+	key, keyOK := evaluateHCLExpressionValue(item.KeyExpr, symbols, nil)
+	if !keyOK || !key.IsKnown() || key.IsNull() {
+		key = cty.UnknownVal(cty.String)
+	} else if converted, err := convert.Convert(key, cty.String); err == nil {
+		key = converted
+	} else {
+		key = cty.UnknownVal(cty.String)
+	}
+
+	value, valueOK := evaluateHCLExpressionValue(item.ValueExpr, symbols, nil)
+	if !valueOK {
+		value = cty.DynamicVal
+	}
+	invocation := moduleInvocation{
+		each: &resourceEachInstance{
+			key:   key,
+			value: value,
+		},
+	}
+	if key.IsKnown() && !key.IsNull() {
+		if goKey, err := ctyToGo(key); err == nil {
+			invocation.key = fmt.Sprint(goKey)
+		}
+	} else {
+		invocation.key = "known-entry"
+	}
+	return invocation, true
+}
+
+func moduleForEachObjectExpression(
+	expression hclsyntax.Expression,
+	symbols *symbolTable,
+	seen map[string]struct{},
+) (*hclsyntax.ObjectConsExpr, bool) {
+	switch typed := expression.(type) {
+	case *hclsyntax.ObjectConsExpr:
+		return typed, true
+	case *hclsyntax.ScopeTraversalExpr:
+		traversal := typed.Traversal
+		if len(traversal) != 2 {
+			return nil, false
+		}
+		root, rootOK := traversal[0].(hcl.TraverseRoot)
+		name, nameOK := traversal[1].(hcl.TraverseAttr)
+		if !rootOK || root.Name != "local" || !nameOK {
+			return nil, false
+		}
+		if _, cyclic := seen[name.Name]; cyclic {
+			return nil, false
+		}
+		attribute, exists := symbols.localExpressions[name.Name]
+		if !exists {
+			return nil, false
+		}
+		seen[name.Name] = struct{}{}
+		return moduleForEachObjectExpression(attribute.Expr, symbols, seen)
+	default:
+		return nil, false
+	}
+}
+
+func moduleInvocations(block *hclsyntax.Block, symbols *symbolTable) []moduleInvocation {
+	if countAttr, hasCount := block.Body.Attributes["count"]; hasCount {
+		countValue, ok := evaluateHCLExpression(countAttr.Expr, symbols, nil)
+		if !ok || countValue.IsNull() || countValue.Type() != cty.Number {
+			return []moduleInvocation{{unresolved: true}}
+		}
+		count, accuracy := countValue.AsBigFloat().Int64()
+		if accuracy != big.Exact || count < 0 {
+			return []moduleInvocation{{unresolved: true}}
+		}
+		if count == 0 {
+			return nil
+		}
+		invocations := make([]moduleInvocation, 0, count)
+		for index := int64(0); index < count; index++ {
+			invocations = append(invocations, moduleInvocation{
+				countIndex:    cty.NumberIntVal(index),
+				hasCountIndex: true,
+				key:           strconv.FormatInt(index, 10),
+			})
+		}
+		return invocations
+	}
+
+	forEachAttr, hasForEach := block.Body.Attributes["for_each"]
+	if !hasForEach {
+		return []moduleInvocation{{}}
+	}
+
+	forEachValue, ok := evaluateHCLExpressionValue(forEachAttr.Expr, symbols, nil)
+	if !ok {
+		if invocation, ok := singleObjectModuleInvocation(forEachAttr.Expr, symbols); ok {
+			return []moduleInvocation{invocation}
+		}
+		return []moduleInvocation{{unresolved: true}}
+	}
+	if !forEachValue.IsKnown() {
+		if invocation, ok := singleObjectModuleInvocation(forEachAttr.Expr, symbols); ok {
+			return []moduleInvocation{invocation}
+		}
+		return []moduleInvocation{{unresolved: true}}
+	}
+	if forEachValue.IsNull() {
+		return []moduleInvocation{{unresolved: true}}
+	}
+	goValue, err := ctyToGo(forEachValue)
+	if err != nil {
+		return []moduleInvocation{{unresolved: true}}
+	}
+	instances, ok := resourceForEachInstances(goValue)
+	if !ok {
+		return []moduleInvocation{{unresolved: true}}
+	}
+
+	invocations := make([]moduleInvocation, 0, len(instances))
+	for _, instance := range instances {
+		keyValue, err := ctyToGo(instance.key)
+		if err != nil {
+			return []moduleInvocation{{unresolved: true}}
+		}
+		invocations = append(invocations, moduleInvocation{
+			each: &instance,
+			key:  fmt.Sprint(keyValue),
+		})
+	}
+	return invocations
+}
+
+func moduleInputOverrides(
+	block *hclsyntax.Block,
+	symbols *symbolTable,
+	each *resourceEachInstance,
+	countIndex ...cty.Value,
+) map[string]cty.Value {
+	overrides := make(map[string]cty.Value)
+	for name, attribute := range block.Body.Attributes {
+		switch name {
+		case "source", "for_each", "count", "providers", "depends_on", "version":
+			continue
+		}
+		value, ok := evaluateHCLExpression(attribute.Expr, symbols, each, countIndex...)
+		if !ok {
+			value = cty.DynamicVal
+		}
+		overrides[name] = value
+	}
+	return overrides
+}
+
+func collectModuleInstanceConfigs(
+	parentFile string,
+	parentNamespace string,
+	parentSymbols *symbolTable,
+	parentUnresolved bool,
+	stack map[string]struct{},
+	filesByDir map[string][]string,
+	moduleBlocksByFile map[string][]*hclsyntax.Block,
+	configs map[string]interface{},
+	moduleConfigs map[string]interface{},
+) error {
+	if parentSymbols == nil {
+		return nil
+	}
+	for _, block := range moduleBlocksByFile[parentFile] {
+		childDir, ok := localModuleDirectory(parentFile, block, parentSymbols)
+		if !ok || len(filesByDir[childDir]) == 0 {
+			continue
+		}
+		if _, cyclic := stack[childDir]; cyclic {
+			continue
+		}
+
+		invocations := moduleInvocations(block, parentSymbols)
+		for invocationIndex, invocation := range invocations {
+			var countIndex []cty.Value
+			if invocation.hasCountIndex {
+				countIndex = append(countIndex, invocation.countIndex)
+			}
+			overrides := moduleInputOverrides(block, parentSymbols, invocation.each, countIndex...)
+			childSymbols, err := loadSymbolTableFromFilesWithOverrides(
+				filesByDir[childDir],
+				overrides,
+			)
+			if err != nil {
+				return fmt.Errorf("load inputs for module %q: %w", block.Labels[0], err)
+			}
+
+			namespace := parentNamespace + "." + block.Labels[0]
+			if invocation.key != "" {
+				namespace += "[" + invocation.key + "]"
+			} else if invocation.unresolved {
+				namespace += "[unresolved]"
+			}
+			stack[childDir] = struct{}{}
+			for _, childFile := range filesByDir[childDir] {
+				childConfig, exists := configs[childFile]
+				if !exists {
+					continue
+				}
+				instanceConfig := normalizeConfigWithSymbols(childConfig, childSymbols)
+				instanceConfig = namespaceModuleResources(instanceConfig, namespace)
+				instanceKey := fmt.Sprintf("%s#module#%s#%d#%s", parentFile, namespace, invocationIndex, childFile)
+				if parentUnresolved || invocation.unresolved {
+					if triggerConfig, hasTriggers := globalTriggerConfig(instanceConfig); hasTriggers {
+						moduleConfigs[instanceKey] = triggerConfig
+					}
+				} else {
+					moduleConfigs[instanceKey] = instanceConfig
+				}
+
+				if err := collectModuleInstanceConfigs(
+					childFile,
+					namespace,
+					childSymbols,
+					parentUnresolved || invocation.unresolved,
+					stack,
+					filesByDir,
+					moduleBlocksByFile,
+					configs,
+					moduleConfigs,
+				); err != nil {
+					return err
+				}
+			}
+			delete(stack, childDir)
+		}
+	}
+	return nil
+}
+
+func globalTriggerConfig(config interface{}) (interface{}, bool) {
+	// Retain project declarations to trigger global checks, but not uncertain
+	// module resources that could otherwise falsely satisfy those checks.
+	configMap, ok := config.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	resources, ok := configMap["resource"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	projects, ok := resources["google_project"]
+	if !ok {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"resource": map[string]interface{}{
+			"google_project": projects,
+		},
+	}, true
+}
+
+func namespaceModuleResources(config interface{}, namespace string) interface{} {
+	configMap, ok := config.(map[string]interface{})
+	if !ok {
+		return config
+	}
+	resources, ok := configMap["resource"].(map[string]interface{})
+	if !ok {
+		return config
+	}
+
+	namespaced := make(map[string]interface{}, len(resources))
+	for resourceType, labelsValue := range resources {
+		labels, ok := labelsValue.(map[string]interface{})
+		if !ok {
+			namespaced[resourceType] = labelsValue
+			continue
+		}
+		namespacedLabels := make(map[string]interface{}, len(labels))
+		for label, entries := range labels {
+			namespacedLabels[namespace+"::"+label] = entries
+		}
+		namespaced[resourceType] = namespacedLabels
+	}
+
+	result := make(map[string]interface{}, len(configMap))
+	for key, value := range configMap {
+		if key == "resource" {
+			result[key] = namespaced
+		} else {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // extractResourceTypes collects the set of OpenTofu resource type names
@@ -290,9 +773,17 @@ func normalizeConfig(file string, config interface{}, dirSymbols map[string]*sym
 		return config
 	}
 
-	dir := filepath.Dir(file)
+	dir := filepath.Clean(filepath.Dir(file))
 	symbols, ok := dirSymbols[dir]
 	if !ok {
+		return config
+	}
+
+	return normalizeConfigWithSymbols(config, symbols)
+}
+
+func normalizeConfigWithSymbols(config interface{}, symbols *symbolTable) interface{} {
+	if symbols == nil {
 		return config
 	}
 
@@ -369,6 +860,9 @@ func expandResourceForEach(value interface{}, symbols *symbolTable) interface{} 
 					continue
 				}
 				forEach, hasForEach := entry["for_each"]
+				if hasForEach {
+					forEach = resolveStaticExpression(forEach, symbols)
+				}
 				instances, resolvable := resourceForEachInstances(forEach)
 				if !hasForEach || !resolvable {
 					expandedEntries = append(expandedEntries, entryValue)
@@ -399,6 +893,31 @@ func expandResourceForEach(value interface{}, symbols *symbolTable) interface{} 
 		}
 	}
 	return normalized
+}
+
+func resolveStaticExpression(value interface{}, symbols *symbolTable) interface{} {
+	expressionText, ok := value.(string)
+	if !ok || !strings.HasPrefix(expressionText, "${") || !strings.HasSuffix(expressionText, "}") {
+		return value
+	}
+	expressionText = strings.TrimSuffix(strings.TrimPrefix(expressionText, "${"), "}")
+	expression, diags := hclsyntax.ParseExpression(
+		[]byte(expressionText),
+		"<tofuscan>",
+		hcl.Pos{Line: 1, Column: 1},
+	)
+	if diags.HasErrors() {
+		return value
+	}
+	resolved, ok := evaluateHCLExpression(expression, symbols, nil)
+	if !ok {
+		return value
+	}
+	goValue, err := ctyToGo(resolved)
+	if err != nil {
+		return value
+	}
+	return goValue
 }
 
 func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) {
@@ -918,7 +1437,7 @@ func applyEachValueToDynamicBlocks(value interface{}, blockName string, key, ite
 func buildDirSymbolTables(files []string) map[string]*symbolTable {
 	byDir := make(map[string][]string)
 	for _, file := range files {
-		dir := filepath.Dir(file)
+		dir := filepath.Clean(filepath.Dir(file))
 		byDir[dir] = append(byDir[dir], file)
 	}
 
@@ -934,7 +1453,17 @@ func buildDirSymbolTables(files []string) map[string]*symbolTable {
 }
 
 func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
+	return loadSymbolTableFromFilesWithOverrides(files, nil)
+}
+
+func loadSymbolTableFromFilesWithOverrides(
+	files []string,
+	overrides map[string]cty.Value,
+) (*symbolTable, error) {
 	variables := make(map[string]cty.Value)
+	variableTypes := make(map[string]cty.Type)
+	variableHasDefault := make(map[string]bool)
+	variableNullable := make(map[string]bool)
 	pending := make(map[string]*hclsyntax.Attribute)
 
 	for _, file := range files {
@@ -955,6 +1484,28 @@ func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
 
 		for name, value := range collectVariableDefaults(body) {
 			variables[name] = value
+			variableHasDefault[name] = true
+		}
+
+		for _, block := range body.Blocks {
+			if block.Type != "variable" || len(block.Labels) != 1 {
+				continue
+			}
+			name := block.Labels[0]
+			variableNullable[name] = true
+			if typeAttr, ok := block.Body.Attributes["type"]; ok {
+				constraint, typeDiags := typeexpr.TypeConstraint(typeAttr.Expr)
+				if !typeDiags.HasErrors() {
+					variableTypes[name] = constraint
+				}
+			}
+			if nullableAttr, ok := block.Body.Attributes["nullable"]; ok {
+				nullableValue, nullableDiags := nullableAttr.Expr.Value(nil)
+				if !nullableDiags.HasErrors() && nullableValue.IsKnown() &&
+					!nullableValue.IsNull() && nullableValue.Type() == cty.Bool {
+					variableNullable[name] = nullableValue.True()
+				}
+			}
 		}
 
 		for _, block := range body.Blocks {
@@ -967,6 +1518,36 @@ func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
 		}
 	}
 
+	for name := range variableNullable {
+		if !variableHasDefault[name] {
+			variables[name] = unknownVariableValue(name, variableTypes)
+		}
+	}
+
+	for name, value := range overrides {
+		if value.IsKnown() && value.IsNull() && !variableNullable[name] {
+			if variableHasDefault[name] {
+				continue
+			}
+			value = unknownVariableValue(name, variableTypes)
+		}
+		if variableType, ok := variableTypes[name]; ok &&
+			variableType != cty.DynamicPseudoType &&
+			variableType != cty.NilType {
+			converted, err := convert.Convert(value, variableType)
+			if err != nil {
+				value = cty.UnknownVal(variableType)
+			} else {
+				value = converted
+			}
+		}
+		variables[name] = value
+	}
+
+	localExpressions := make(map[string]*hclsyntax.Attribute, len(pending))
+	for name, attribute := range pending {
+		localExpressions[name] = attribute
+	}
 	locals := resolveLocals(pending, variables) // resolves inter-local and var references
 
 	variableValues, err := ctyMapToGo(variables)
@@ -979,11 +1560,21 @@ func loadSymbolTableFromFiles(files []string) (*symbolTable, error) {
 	}
 
 	return &symbolTable{
-		locals:         localValues,
-		variables:      variableValues,
-		localValues:    ctyObject(locals),
-		variableValues: ctyObject(variables),
+		locals:           localValues,
+		variables:        variableValues,
+		localExpressions: localExpressions,
+		localValues:      ctyObject(locals),
+		variableValues:   ctyObject(variables),
 	}, nil
+}
+
+func unknownVariableValue(name string, variableTypes map[string]cty.Type) cty.Value {
+	if variableType, ok := variableTypes[name]; ok &&
+		variableType != cty.DynamicPseudoType &&
+		variableType != cty.NilType {
+		return cty.UnknownVal(variableType)
+	}
+	return cty.DynamicVal
 }
 
 func collectVariableDefaults(body *hclsyntax.Body) map[string]cty.Value {
@@ -1072,7 +1663,7 @@ func ctyMapToGo(values map[string]cty.Value) (map[string]interface{}, error) {
 
 func ctyToGo(value cty.Value) (interface{}, error) {
 	if !value.IsKnown() {
-		return nil, fmt.Errorf("cannot convert an unknown cty value to Go")
+		return "${tofuscan_unknown}", nil
 	}
 	if value.IsNull() {
 		return nil, nil

@@ -35,7 +35,7 @@ var (
 	severityPattern     = regexp.MustCompile(`"severity"\s*:\s*"([^"]+)"`)
 	titlePattern        = regexp.MustCompile(`"title"\s*:\s*"([^"]+)"`)
 	titleConcatPattern  = regexp.MustCompile(`(?s)_title_\w+\s*:=\s*concat\("",\s*\[(.*?)\]\)`)
-	descConcatPattern   = regexp.MustCompile(`(?s)_desc_\w+\s*:=\s*concat\("",\s*\[(.*?)\]\)`)
+	descConcatPattern   = regexp.MustCompile(`(?s)(?:_desc_\w+\s*:=\s*concat\("",\s*\[(.*?)\]\)|"description"\s*:\s*concat\("",\s*\[(.*?)\]\))`)
 	concatPartPattern   = regexp.MustCompile(`"([^"]+)"`)
 )
 
@@ -554,7 +554,14 @@ func extractConcat(pattern *regexp.Regexp, text string) string {
 	if len(m) < 2 {
 		return ""
 	}
-	parts := concatPartPattern.FindAllStringSubmatch(m[1], -1)
+	var concat string
+	for _, match := range m[1:] {
+		if match != "" {
+			concat = match
+			break
+		}
+	}
+	parts := concatPartPattern.FindAllStringSubmatch(concat, -1)
 	var sb strings.Builder
 	for _, p := range parts {
 		if len(p) > 1 {
