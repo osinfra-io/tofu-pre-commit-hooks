@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/open-policy-agent/conftest/parser"
+	"github.com/zclconf/go-cty/cty"
 
 	"tofu-pre-commit-hooks/internal/tofuscan/policies"
 )
@@ -697,6 +698,45 @@ func TestExpandDynamicBlocksUnresolvedPreserved(t *testing.T) {
 	}
 }
 
+func TestResourceForEachRejectsUnresolvedMapKeys(t *testing.T) {
+	tests := map[string]interface{}{
+		"root key": map[string]interface{}{
+			"${var.metric_name}": "roles/owner",
+		},
+		"nested key": map[string]interface{}{
+			"ownership": map[string]interface{}{
+				"${var.metric_name}": "roles/owner",
+			},
+		},
+	}
+
+	for name, collection := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, resolvable := resourceForEachInstances(collection); resolvable {
+				t.Fatal("collection with an unresolved map key was expanded")
+			}
+		})
+	}
+}
+
+func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T) {
+	symbols := &symbolTable{
+		localValues:    cty.EmptyObjectVal,
+		variableValues: cty.EmptyObjectVal,
+	}
+	instance := resourceEachInstance{
+		key: cty.StringVal("metric"),
+		value: cty.ObjectVal(map[string]cty.Value{
+			"suffix": cty.StringVal("ownership"),
+		}),
+	}
+
+	got := applyResourceEachValue("${each.key}-${each.value.suffix}", instance, symbols)
+	if got != "metric-ownership" {
+		t.Fatalf("mixed template: got %#v, want %q", got, "metric-ownership")
+	}
+}
+
 func TestResourceForEachLogMetricsAndAlerts(t *testing.T) {
 	content := `variable "enable_owner" {
   type = bool
@@ -817,12 +857,79 @@ resource "google_monitoring_alert_policy" "cis" {
 			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
 		},
 		{
+			name: "unresolved key in collection",
+			content: `variable "metric_name" {
+  type = string
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = { (var.metric_name) = "roles/owner" }
+  name     = each.key != "" ? "ownership" : "other"
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = { ownership = "alert" }
+  conditions {
+    condition_threshold {
+      filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
 			name: "unresolved metric filter",
 			content: strings.Replace(content,
 				`filter  = each.value`,
 				`filter  = each.key == "ownership" ? (var.enable_owner ? "roles/owner" : each.value) : each.value`,
 				1),
 			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name: "dynamic block iterator shadows resource each",
+			content: `locals {
+  metrics = {
+    ownership = "roles/owner"
+  }
+  alerts = {
+    ownership = {
+      filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+    }
+  }
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = local.metrics
+  name     = each.key
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.alerts
+  conditions {
+    dynamic "condition_threshold" {
+      for_each = [{ filter = "metric.type=\"logging.googleapis.com/user/mismatched\""}]
+      iterator = each
+      content {
+        filter = each.value.filter
+      }
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
 		},
 		{
 			name: "string set for_each",

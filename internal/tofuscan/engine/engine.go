@@ -377,7 +377,7 @@ func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) 
 	case map[string]interface{}:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
-			if hasUnresolvedExpression(typed[key]) {
+			if hasUnresolvedExpression(key) || hasUnresolvedExpression(typed[key]) {
 				return nil, false
 			}
 			keys = append(keys, key)
@@ -436,8 +436,8 @@ func hasUnresolvedExpression(value interface{}) bool {
 			}
 		}
 	case map[string]interface{}:
-		for _, item := range typed {
-			if hasUnresolvedExpression(item) {
+		for key, item := range typed {
+			if hasUnresolvedExpression(key) || hasUnresolvedExpression(item) {
 				return true
 			}
 		}
@@ -472,7 +472,11 @@ func applyResourceEachValue(value interface{}, instance resourceEachInstance, sy
 	case map[string]interface{}:
 		resolved := make(map[string]interface{}, len(typed))
 		for key, item := range typed {
-			resolved[key] = applyResourceEachValue(item, instance, symbols)
+			if key == "dynamic" {
+				resolved[key] = applyResourceEachDynamicBlocks(item, instance, symbols)
+			} else {
+				resolved[key] = applyResourceEachValue(item, instance, symbols)
+			}
 		}
 		return resolved
 	case string:
@@ -518,6 +522,49 @@ func applyResourceEachValue(value interface{}, instance resourceEachInstance, sy
 	default:
 		return value
 	}
+}
+
+func applyResourceEachDynamicBlocks(value interface{}, instance resourceEachInstance, symbols *symbolTable) interface{} {
+	dynamicBlocks, ok := value.(map[string]interface{})
+	if !ok {
+		return applyResourceEachValue(value, instance, symbols)
+	}
+
+	resolved := make(map[string]interface{}, len(dynamicBlocks))
+	for blockName, entriesValue := range dynamicBlocks {
+		entries, ok := entriesValue.([]interface{})
+		if !ok {
+			resolved[blockName] = applyResourceEachValue(entriesValue, instance, symbols)
+			continue
+		}
+
+		resolvedEntries := make([]interface{}, len(entries))
+		for i, entryValue := range entries {
+			entry, ok := entryValue.(map[string]interface{})
+			if !ok {
+				resolvedEntries[i] = applyResourceEachValue(entryValue, instance, symbols)
+				continue
+			}
+
+			iterator := blockName
+			if name, ok := entry["iterator"].(string); ok && name != "" {
+				iterator = strings.TrimSuffix(strings.TrimPrefix(name, "${"), "}")
+			}
+			resolvedEntry := make(map[string]interface{}, len(entry))
+			for key, item := range entry {
+				if key == "iterator" {
+					resolvedEntry[key] = iterator
+				} else if key == "content" && iterator == "each" {
+					resolvedEntry[key] = item
+				} else {
+					resolvedEntry[key] = applyResourceEachValue(item, instance, symbols)
+				}
+			}
+			resolvedEntries[i] = resolvedEntry
+		}
+		resolved[blockName] = resolvedEntries
+	}
+	return resolved
 }
 
 // expandDynamicBlocks recursively expands HCL dynamic blocks where for_each
