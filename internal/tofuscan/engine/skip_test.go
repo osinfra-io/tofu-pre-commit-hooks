@@ -3,8 +3,18 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func readFileSkips(t *testing.T, path string) map[string]map[string]string {
+	t.Helper()
+	skips, err := parseFileSkips(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return skips
+}
 
 func TestParseSkipComment(t *testing.T) {
 	cases := []struct {
@@ -58,7 +68,7 @@ resource "google_compute_firewall" "allow" {
 		t.Fatal(err)
 	}
 
-	resourceLevel := parseFileSkips(f)
+	resourceLevel := readFileSkips(t, f)
 
 	// Resource "google_container_cluster.primary": CIS 5.5.1 + CIS 5.6.4 (both inside block)
 	primarySkips := resourceLevel["google_container_cluster.primary"]
@@ -100,7 +110,7 @@ resource "b" "second" {
 		t.Fatal(err)
 	}
 
-	resourceLevel := parseFileSkips(f)
+	resourceLevel := readFileSkips(t, f)
 
 	if firstSkips := resourceLevel["a.first"]; len(firstSkips) != 0 {
 		t.Errorf("expected no skips for 'a.first', got %v", firstSkips)
@@ -114,7 +124,6 @@ func TestFilterSkipped(t *testing.T) {
 	violations := []Violation{
 		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.6.4", RuleID: "gke/cis/5.6.4"},
 		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.5.1", RuleID: "gke/cis/5.5.1"},
-		{File: "a.tofu", Resource: "google_container_cluster.primary", CISControl: "5.6.3", RuleID: "gke/cis/5.6.3"},
 		{File: "a.tofu", Resource: "google_compute_firewall.allow", CISControl: "3.3", RuleID: "gcp/cis/3.3"},
 		{File: "", Resource: "global", CISControl: "2.2", RuleID: "gcp/cis/2.2"},
 	}
@@ -122,7 +131,7 @@ func TestFilterSkipped(t *testing.T) {
 	sd := &SkipDirectives{
 		resourceLevel: map[string]map[string]map[string]string{
 			"a.tofu": {
-				"google_container_cluster.primary": {"5.6.4": "not needed", "5.6.3": ""},
+				"google_container_cluster.primary": {"5.6.4": "not needed"},
 			},
 		},
 	}
@@ -132,22 +141,41 @@ func TestFilterSkipped(t *testing.T) {
 	if len(kept) != 3 {
 		t.Errorf("expected 3 kept violations, got %d", len(kept))
 	}
-	if len(skipped) != 2 {
-		t.Fatalf("expected 2 skipped violations, got %d", len(skipped))
+	if len(skipped) != 1 {
+		t.Fatalf("expected 1 skipped violation, got %d", len(skipped))
 	}
 
 	if skipped[0].CISControl != "5.6.4" || skipped[0].SkipReason != "not needed" {
 		t.Errorf("expected CIS 5.6.4 with reason, got %+v", skipped[0])
 	}
-	if skipped[1].CISControl != "5.6.3" || skipped[1].SkipReason != "" {
-		t.Errorf("expected CIS 5.6.3 without reason, got %+v", skipped[1])
-	}
 }
 
 func TestParseFileSkipsNonexistentFile(t *testing.T) {
-	resourceLevel := parseFileSkips("/nonexistent/file.tofu")
-	if len(resourceLevel) != 0 {
-		t.Errorf("expected empty results for nonexistent file")
+	_, err := parseFileSkips(filepath.Join(t.TempDir(), "nonexistent.tofu"))
+	if err == nil {
+		t.Fatal("expected an error for nonexistent file")
+	}
+}
+
+func TestSkipDirectivesRequireReason(t *testing.T) {
+	for _, line := range []string{
+		"# tofu-scan skip: CIS 5.6.4",
+		"# tofu-scan skip: CIS 5.6.4 -",
+		"# tofu-scan skip: CIS 5.6.4 -   ",
+		"# tofu-scan skip: CIS 5.6.4 missing separator",
+		"# tofu-scan skip: CIS",
+	} {
+		t.Run(line, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "main.tofu")
+			content := "resource \"google_container_cluster\" \"primary\" {\n  " + line + "\n}\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := ParseSkipDirectives([]string{path})
+			if err == nil || !strings.Contains(err.Error(), path+":2:") || !strings.Contains(err.Error(), "non-empty reason") {
+				t.Fatalf("expected file, line and reason error, got %v", err)
+			}
+		})
 	}
 }
 
@@ -166,7 +194,7 @@ func TestParseFileSkipsNestedBraces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resourceLevel := parseFileSkips(f)
+	resourceLevel := readFileSkips(t, f)
 
 	primarySkips := resourceLevel["google_container_cluster.primary"]
 	if primarySkips == nil || len(primarySkips) != 1 {
@@ -195,7 +223,7 @@ resource "google_storage_bucket" "bucket" {
 		t.Fatal(err)
 	}
 
-	resourceLevel := parseFileSkips(f)
+	resourceLevel := readFileSkips(t, f)
 
 	primarySkips := resourceLevel["google_container_cluster.primary"]
 	if primarySkips == nil || len(primarySkips) != 1 {
@@ -255,7 +283,7 @@ resource "google_storage_bucket" "this" {
 		t.Fatal(err)
 	}
 
-	resourceLevel := parseFileSkips(f)
+	resourceLevel := readFileSkips(t, f)
 
 	clusterSkips := resourceLevel["google_container_cluster.this"]
 	if clusterSkips == nil || len(clusterSkips) != 1 {

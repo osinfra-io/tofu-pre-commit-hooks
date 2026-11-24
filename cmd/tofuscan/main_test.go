@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"tofu-pre-commit-hooks/internal/tofuscan/engine"
@@ -15,7 +18,10 @@ func TestRunTofuScanCLI(t *testing.T) {
 		{RuleID: "CIS-1.1", File: "main.tofu", Severity: "High"},
 		{RuleID: "CIS-1.2", File: "main.tofu", Severity: "Medium"},
 	}}
-	noSkips := engine.ParseSkipDirectives([]string{})
+	noSkips, err := engine.ParseSkipDirectives([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
 		name      string
@@ -25,6 +31,7 @@ func TestRunTofuScanCLI(t *testing.T) {
 		findErr   error
 		result    *engine.RunResult
 		engineErr error
+		skipErr   error
 		wantExit  int
 		wantErr   bool
 	}{
@@ -48,6 +55,16 @@ func TestRunTofuScanCLI(t *testing.T) {
 			engineErr: fmt.Errorf("opa error"),
 			wantExit:  exitError,
 			wantErr:   true,
+		},
+		{
+			name:     "invalid skip fails even with warn-only",
+			paths:    []string{"."},
+			warnOnly: true,
+			files:    []string{"main.tofu"},
+			result:   noViolations,
+			skipErr:  fmt.Errorf("skip directive requires a reason"),
+			wantExit: exitError,
+			wantErr:  true,
 		},
 		{
 			name:     "no violations",
@@ -106,7 +123,7 @@ func TestRunTofuScanCLI(t *testing.T) {
 				tc.warnOnly,
 				findFiles,
 				runEngine,
-				func(files []string) *engine.SkipDirectives { return noSkips },
+				func(files []string) (*engine.SkipDirectives, error) { return noSkips, tc.skipErr },
 				printOutput,
 				exitFn,
 			)
@@ -119,6 +136,49 @@ func TestRunTofuScanCLI(t *testing.T) {
 			}
 			if gotExit != tc.wantExit {
 				t.Errorf("exit code = %d, want %d", gotExit, tc.wantExit)
+			}
+		})
+	}
+}
+
+func TestRunTofuScanCLISkipReasons(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		directive   string
+		wantErr     bool
+		wantSkipped string
+	}{
+		{name: "reason displayed", directive: "# tofu-scan skip: CIS 5.6.4 - Private access", wantSkipped: "Private access"},
+		{name: "missing reason fails with warn-only", directive: "# tofu-scan skip: CIS 5.6.4", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "main.tofu")
+			content := "resource \"google_container_cluster\" \"primary\" {\n  " + tt.directive + "\n}\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var exitCode int
+			var skipped []engine.Violation
+			err := RunTofuScanCLI(
+				[]string{path}, true,
+				func([]string) ([]string, error) { return []string{path}, nil },
+				func([]string) (*engine.RunResult, error) {
+					return &engine.RunResult{Violations: []engine.Violation{{
+						File: path, Resource: "google_container_cluster.primary", CISControl: "5.6.4", Severity: "High",
+					}}}, nil
+				},
+				engine.ParseSkipDirectives,
+				func(_ []engine.Violation, got []engine.Violation, _ map[string]struct{}) { skipped = got },
+				func(code int) { exitCode = code },
+			)
+			if tt.wantErr {
+				if err == nil || exitCode != exitError || !strings.Contains(err.Error(), path+":2:") {
+					t.Fatalf("expected invalid skip error with location, got error %v and exit %d", err, exitCode)
+				}
+				return
+			}
+			if err != nil || exitCode != exitSuccess || len(skipped) != 1 || skipped[0].SkipReason != tt.wantSkipped {
+				t.Fatalf("expected skipped reason %q, got skips %+v, error %v, exit %d", tt.wantSkipped, skipped, err, exitCode)
 			}
 		})
 	}

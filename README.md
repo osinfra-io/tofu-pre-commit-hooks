@@ -130,7 +130,7 @@ resource "google_compute_firewall" "allow_ssh" {
 }
 ```
 
-The format is `# tofu-scan skip: CIS <control> [- <reason>]`. Skip comments placed outside a resource block are ignored. Skipped violations appear in the output summary so they remain visible.
+The format is `# tofu-scan skip: CIS <control> - <reason>`; a non-empty reason is required and shown in the skipped output. Invalid skip comments inside resource blocks fail the scan, including with `--warn-only`. Skip comments placed outside a resource block are ignored. Project-level findings cannot be skipped this way because they are not attached to a specific resource. Skipped violations appear in the output summary so they remain visible.
 
 Replace `<release-or-commit-sha>` with the desired version or commit hash.
 
