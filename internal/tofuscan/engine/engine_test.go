@@ -1422,13 +1422,14 @@ func TestNormalizeConfigResolvesReferencesAcrossFiles(t *testing.T) {
 
 func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 	tests := []struct {
-		name          string
-		rootVariables string
-		rootLocals    string
-		moduleForEach string
-		moduleCount   string
-		services      string
-		wantViolation bool
+		name            string
+		rootVariables   string
+		rootLocals      string
+		moduleForEach   string
+		moduleCount     string
+		omitRootProject bool
+		services        string
+		wantViolation   bool
 	}{
 		{
 			name: "service supplied by caller",
@@ -1454,11 +1455,12 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			wantViolation: true,
 		},
 		{
-			name:          "unknown module instances do not satisfy existence checks",
-			rootVariables: "variable \"projects\" {\n  type = map(string)\n}\n",
-			moduleForEach: "var.projects",
-			services:      `["cloudasset.googleapis.com"]`,
-			wantViolation: true,
+			name:            "unknown module instances do not satisfy existence checks",
+			rootVariables:   "variable \"projects\" {\n  type = map(string)\n}\n",
+			moduleForEach:   "var.projects",
+			omitRootProject: true,
+			services:        `["cloudasset.googleapis.com"]`,
+			wantViolation:   true,
 		},
 		{
 			name:          "single object entry guarantees a module instance",
@@ -1473,11 +1475,12 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			services:      `["cloudasset.googleapis.com"]`,
 		},
 		{
-			name:          "unknown module count does not satisfy existence checks",
-			rootVariables: "variable \"project_count\" {\n  type = number\n}\n",
-			moduleCount:   "var.project_count",
-			services:      `["cloudasset.googleapis.com"]`,
-			wantViolation: true,
+			name:            "unknown module count does not satisfy existence checks",
+			rootVariables:   "variable \"project_count\" {\n  type = number\n}\n",
+			moduleCount:     "var.project_count",
+			omitRootProject: true,
+			services:        `["cloudasset.googleapis.com"]`,
+			wantViolation:   true,
 		},
 		{
 			name:        "count index resolves module input",
@@ -1497,12 +1500,16 @@ func TestCIS2_14ResolvesLocalModuleInputs(t *testing.T) {
 			projectVariables := filepath.Join(projectDir, "variables.tofu")
 			projectMain := filepath.Join(projectDir, "main.tofu")
 
-			rootContent := tt.rootVariables + tt.rootLocals + `resource "google_project" "root" {
+			rootContent := tt.rootVariables + tt.rootLocals
+			if !tt.omitRootProject {
+				rootContent += `resource "google_project" "root" {
   name       = "root-project"
   project_id = "root-project"
 }
 
-module "project" {
+`
+			}
+			rootContent += `module "project" {
   source = "./project"
 `
 			if tt.moduleForEach != "" {

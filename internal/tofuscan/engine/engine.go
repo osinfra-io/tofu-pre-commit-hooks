@@ -518,7 +518,11 @@ func collectModuleInstanceConfigs(
 				instanceConfig := normalizeConfigWithSymbols(childConfig, childSymbols)
 				instanceConfig = namespaceModuleResources(instanceConfig, namespace)
 				instanceKey := fmt.Sprintf("%s#module#%s#%d#%s", parentFile, namespace, invocationIndex, childFile)
-				if !parentUnresolved && !invocation.unresolved {
+				if parentUnresolved || invocation.unresolved {
+					if triggerConfig, hasTriggers := globalTriggerConfig(instanceConfig); hasTriggers {
+						moduleConfigs[instanceKey] = triggerConfig
+					}
+				} else {
 					moduleConfigs[instanceKey] = instanceConfig
 				}
 
@@ -540,6 +544,28 @@ func collectModuleInstanceConfigs(
 		}
 	}
 	return nil
+}
+
+func globalTriggerConfig(config interface{}) (interface{}, bool) {
+	// Retain project declarations to trigger global checks, but not uncertain
+	// module resources that could otherwise falsely satisfy those checks.
+	configMap, ok := config.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	resources, ok := configMap["resource"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	projects, ok := resources["google_project"]
+	if !ok {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"resource": map[string]interface{}{
+			"google_project": projects,
+		},
+	}, true
 }
 
 func namespaceModuleResources(config interface{}, namespace string) interface{} {
