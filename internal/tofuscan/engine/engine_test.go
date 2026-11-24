@@ -1004,6 +1004,33 @@ func TestCtyGoConversionPreservesNestedSets(t *testing.T) {
 	}
 }
 
+func TestCtyGoConversionPreservesSetElementType(t *testing.T) {
+	listType := cty.List(cty.String)
+	nestedSet := cty.SetVal([]cty.Value{
+		cty.ListVal([]cty.Value{cty.StringVal("a")}),
+		cty.ListVal([]cty.Value{cty.StringVal("b"), cty.StringVal("c")}),
+	})
+	value := cty.ObjectVal(map[string]cty.Value{"members": nestedSet})
+	resourceValues := cty.MapVal(map[string]cty.Value{"example": value})
+
+	goValue, err := ctyToGo(resourceValues)
+	if err != nil {
+		t.Fatalf("ctyToGo: %v", err)
+	}
+	instances, ok := resourceForEachInstances(goValue)
+	if !ok || len(instances) != 1 {
+		t.Fatalf("resource for_each instances: got %#v, want one instance", instances)
+	}
+	convertedSet := instances[0].value.GetAttr("members")
+	wantType := cty.Set(listType)
+	if !convertedSet.Type().Equals(wantType) {
+		t.Fatalf("nested set type: got %s, want %s", convertedSet.Type().FriendlyName(), wantType.FriendlyName())
+	}
+	if convertedSet.LengthInt() != 2 {
+		t.Fatalf("nested set length: got %d, want 2", convertedSet.LengthInt())
+	}
+}
+
 func TestExpandDynamicBlocksPreservesShadowedNestedIterator(t *testing.T) {
 	input := map[string]interface{}{
 		"dynamic": map[string]interface{}{

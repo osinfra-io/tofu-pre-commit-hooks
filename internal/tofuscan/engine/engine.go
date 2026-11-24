@@ -492,6 +492,13 @@ func ctyValueFromGo(value interface{}) (cty.Value, bool) {
 			if !ok {
 				return cty.NilVal, false
 			}
+			if typed.elementType != cty.NilType && typed.elementType != cty.DynamicPseudoType {
+				constrained, err := convert.Convert(converted, typed.elementType)
+				if err != nil {
+					return cty.NilVal, false
+				}
+				converted = constrained
+			}
 			elements = append(elements, converted)
 		}
 		if len(elements) == 0 {
