@@ -295,12 +295,38 @@ func normalizeConfig(file string, config interface{}, dirSymbols map[string]*sym
 	}
 
 	resolved := resolveReferences(config, symbols)
-	return expandDynamicBlocks(expandResourceForEach(resolved, symbols))
+	expanded := expandDynamicBlocks(expandResourceForEach(resolved, symbols))
+	return unwrapSetValues(expanded)
 }
 
 type resourceEachInstance struct {
 	key   cty.Value
 	value cty.Value
+}
+
+type setValues struct {
+	values []interface{}
+}
+
+func unwrapSetValues(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case setValues:
+		return unwrapSetValues(typed.values)
+	case []interface{}:
+		resolved := make([]interface{}, len(typed))
+		for i, item := range typed {
+			resolved[i] = unwrapSetValues(item)
+		}
+		return resolved
+	case map[string]interface{}:
+		resolved := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			resolved[key] = unwrapSetValues(item)
+		}
+		return resolved
+	default:
+		return value
+	}
 }
 
 // expandResourceForEach materialises resource-level for_each blocks when their
@@ -397,6 +423,9 @@ func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) 
 		}
 		return instances, true
 
+	case setValues:
+		return resourceForEachInstances(typed.values)
+
 	case []interface{}:
 		values := make(map[string]struct{}, len(typed))
 		for _, item := range typed {
@@ -438,6 +467,12 @@ func hasUnresolvedExpression(value interface{}) bool {
 	case map[string]interface{}:
 		for key, item := range typed {
 			if hasUnresolvedExpression(key) || hasUnresolvedExpression(item) {
+				return true
+			}
+		}
+	case setValues:
+		for _, item := range typed.values {
+			if hasUnresolvedExpression(item) {
 				return true
 			}
 		}
@@ -630,20 +665,12 @@ func expandDynamicBlocks(value interface{}) interface{} {
 						unexpanded = append(unexpanded, entry)
 						continue
 					}
-
-					// Normalise for_each to a []interface{} of items.
-					// For maps, the values become the iteration items; keys
-					// are not surfaced in content templates at this level.
-					var items []interface{}
-					switch v := forEachVal.(type) {
-					case []interface{}:
-						items = v
-					case map[string]interface{}:
-						for _, val := range v {
-							items = append(items, val)
-						}
-					default:
-						// Unresolved or unsupported type — preserve the entry.
+					if hasUnresolvedExpression(forEachVal) {
+						unexpanded = append(unexpanded, entry)
+						continue
+					}
+					instances, ok := dynamicForEachInstances(forEachVal)
+					if !ok {
 						unexpanded = append(unexpanded, entry)
 						continue
 					}
@@ -652,19 +679,19 @@ func expandDynamicBlocks(value interface{}) interface{} {
 					// the default iteration variable name (the block label).
 					iterName := blockName
 					if iter, ok := entryMap["iterator"].(string); ok && iter != "" {
-						iterName = iter
+						iterName = strings.TrimSuffix(strings.TrimPrefix(iter, "${"), "}")
 					}
 
 					contentEntries, _ := entryMap["content"].([]interface{})
 					existing, _ := result[blockName].([]interface{})
-					for _, item := range items {
+					for _, instance := range instances {
 						if len(contentEntries) > 0 {
 							for _, ce := range contentEntries {
-								materialised := applyEachValue(ce, iterName, item)
+								materialised := applyEachValue(ce, iterName, instance.key, instance.value)
 								existing = append(existing, expandDynamicBlocks(materialised))
 							}
 						} else {
-							existing = append(existing, expandDynamicBlocks(item))
+							existing = append(existing, expandDynamicBlocks(instance.value))
 						}
 					}
 					result[blockName] = existing
@@ -685,22 +712,75 @@ func expandDynamicBlocks(value interface{}) interface{} {
 	}
 }
 
+type dynamicEachInstance struct {
+	key   interface{}
+	value interface{}
+}
+
+func dynamicForEachInstances(value interface{}) ([]dynamicEachInstance, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		instances := make([]dynamicEachInstance, 0, len(keys))
+		for _, key := range keys {
+			instances = append(instances, dynamicEachInstance{key: key, value: typed[key]})
+		}
+		return instances, true
+
+	case setValues:
+		instances := make([]dynamicEachInstance, 0, len(typed.values))
+		for _, item := range typed.values {
+			if hasUnresolvedExpression(item) {
+				return nil, false
+			}
+			instances = append(instances, dynamicEachInstance{key: item, value: item})
+		}
+		return instances, true
+
+	case []interface{}:
+		instances := make([]dynamicEachInstance, 0, len(typed))
+		for index, item := range typed {
+			if hasUnresolvedExpression(item) {
+				return nil, false
+			}
+			instances = append(instances, dynamicEachInstance{key: index, value: item})
+		}
+		return instances, true
+
+	default:
+		return nil, false
+	}
+}
+
 // applyEachValue recursively replaces "${<blockName>.value.<attr>}" reference
 // strings in a content template with the corresponding attribute value from
 // the current for_each item. This mimics OpenTofu's dynamic block iteration
 // variable (<blockName>.value) at the level of static policy analysis.
-func applyEachValue(value interface{}, blockName string, item interface{}) interface{} {
-	prefix := blockName + ".value."
+func applyEachValue(value interface{}, blockName string, key, item interface{}) interface{} {
+	keyReference := blockName + ".key"
+	valueReference := blockName + ".value"
+	valuePrefix := valueReference + "."
 	switch typed := value.(type) {
 	case string:
 		if !strings.HasPrefix(typed, "${") || !strings.HasSuffix(typed, "}") {
 			return typed
 		}
 		expr := strings.TrimSuffix(strings.TrimPrefix(typed, "${"), "}")
-		if strings.HasPrefix(expr, prefix) {
-			attr := strings.TrimPrefix(expr, prefix)
+		if expr == keyReference {
+			return key
+		}
+		if expr == valueReference {
+			return item
+		}
+		if strings.HasPrefix(expr, valuePrefix) {
+			attr := strings.TrimPrefix(expr, valuePrefix)
 			if itemMap, ok := item.(map[string]interface{}); ok {
-				if v, exists := itemMap[attr]; exists {
+				if v, exists := lookupReference(itemMap, strings.Split(attr, ".")); exists {
 					return v
 				}
 			}
@@ -709,13 +789,13 @@ func applyEachValue(value interface{}, blockName string, item interface{}) inter
 	case map[string]interface{}:
 		resolved := make(map[string]interface{}, len(typed))
 		for k, v := range typed {
-			resolved[k] = applyEachValue(v, blockName, item)
+			resolved[k] = applyEachValue(v, blockName, key, item)
 		}
 		return resolved
 	case []interface{}:
 		resolved := make([]interface{}, len(typed))
 		for i, v := range typed {
-			resolved[i] = applyEachValue(v, blockName, item)
+			resolved[i] = applyEachValue(v, blockName, key, item)
 		}
 		return resolved
 	default:
@@ -919,12 +999,68 @@ func resolveReferenceString(value string, symbols *symbolTable) (interface{}, bo
 	expr := strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}")
 	switch {
 	case strings.HasPrefix(expr, "var."):
-		return lookupReference(symbols.variables, strings.Split(strings.TrimPrefix(expr, "var."), "."))
+		path := strings.Split(strings.TrimPrefix(expr, "var."), ".")
+		resolved, ok := lookupReference(symbols.variables, path)
+		if !ok {
+			return nil, false
+		}
+		if value, ok := lookupCtyReference(symbols.variableValues, path); ok && value.Type().IsSetType() {
+			if values, ok := resolved.([]interface{}); ok {
+				return setValues{values: values}, true
+			}
+		}
+		return resolved, true
 	case strings.HasPrefix(expr, "local."):
-		return lookupReference(symbols.locals, strings.Split(strings.TrimPrefix(expr, "local."), "."))
+		path := strings.Split(strings.TrimPrefix(expr, "local."), ".")
+		resolved, ok := lookupReference(symbols.locals, path)
+		if !ok {
+			return nil, false
+		}
+		if value, ok := lookupCtyReference(symbols.localValues, path); ok && value.Type().IsSetType() {
+			if values, ok := resolved.([]interface{}); ok {
+				return setValues{values: values}, true
+			}
+		}
+		return resolved, true
 	default:
 		return nil, false
 	}
+}
+
+func lookupCtyReference(root cty.Value, path []string) (cty.Value, bool) {
+	current := root
+	for _, segment := range path {
+		if !current.IsKnown() || current.IsNull() {
+			return cty.NilVal, false
+		}
+
+		switch ty := current.Type(); {
+		case ty.IsObjectType():
+			if !ty.HasAttribute(segment) {
+				return cty.NilVal, false
+			}
+			current = current.GetAttr(segment)
+		case ty.IsMapType():
+			key := cty.StringVal(segment)
+			if !current.HasIndex(key).True() {
+				return cty.NilVal, false
+			}
+			current = current.Index(key)
+		case ty.IsListType(), ty.IsTupleType():
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 {
+				return cty.NilVal, false
+			}
+			key := cty.NumberIntVal(int64(index))
+			if !current.HasIndex(key).True() {
+				return cty.NilVal, false
+			}
+			current = current.Index(key)
+		default:
+			return cty.NilVal, false
+		}
+	}
+	return current, true
 }
 
 func lookupReference(root map[string]interface{}, path []string) (interface{}, bool) {

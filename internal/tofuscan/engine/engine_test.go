@@ -719,6 +719,23 @@ func TestResourceForEachRejectsUnresolvedMapKeys(t *testing.T) {
 	}
 }
 
+func TestUnwrapSetValuesRecursively(t *testing.T) {
+	input := map[string]interface{}{
+		"resource": []interface{}{
+			map[string]interface{}{
+				"members": setValues{values: []interface{}{"reader"}},
+			},
+		},
+	}
+
+	got := unwrapSetValues(input).(map[string]interface{})
+	resource := got["resource"].([]interface{})[0].(map[string]interface{})
+	members := resource["members"].([]interface{})
+	if len(members) != 1 || members[0] != "reader" {
+		t.Fatalf("members: got %#v, want [reader]", members)
+	}
+}
+
 func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T) {
 	symbols := &symbolTable{
 		localValues:    cty.EmptyObjectVal,
@@ -734,6 +751,139 @@ func TestApplyResourceEachValueResolvesMixedTemplateWithObjectValue(t *testing.T
 	got := applyResourceEachValue("${each.key}-${each.value.suffix}", instance, symbols)
 	if got != "metric-ownership" {
 		t.Fatalf("mixed template: got %#v, want %q", got, "metric-ownership")
+	}
+}
+
+func TestCIS2_1DynamicAuditLogConfig(t *testing.T) {
+	setContent := `locals {
+  audit_log_config_types = toset(["ADMIN_READ", "DATA_READ", "DATA_WRITE"])
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`
+
+	tests := []struct {
+		name          string
+		content       string
+		wantViolation bool
+	}{
+		{name: "set keys satisfy required types", content: setContent},
+		{
+			name:          "missing required type",
+			content:       strings.Replace(setContent, `, "DATA_WRITE"`, "", 1),
+			wantViolation: true,
+		},
+		{
+			name: "exempted members remain a violation",
+			content: strings.Replace(setContent,
+				`log_type = audit_log_config.key`,
+				`log_type = audit_log_config.key
+      exempted_members = ["user:someone@example.com"]`,
+				1),
+			wantViolation: true,
+		},
+		{
+			name: "unresolved set remains a violation",
+			content: `variable "audit_log_config_types" {
+  type = set(string)
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = var.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+			wantViolation: true,
+		},
+		{
+			name: "map keys with custom iterator",
+			content: `locals {
+  audit_log_config_types = {
+    ADMIN_READ = "first"
+    DATA_READ  = "second"
+    DATA_WRITE = "third"
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    iterator = audit
+    content {
+      log_type = audit.key
+    }
+  }
+}
+`,
+		},
+		{
+			name: "map values with custom iterator",
+			content: `locals {
+  audit_log_config_types = {
+    first  = "ADMIN_READ"
+    second = "DATA_READ"
+    third  = "DATA_WRITE"
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = local.audit_log_config_types
+    iterator = audit
+    content {
+      log_type = audit.value
+    }
+  }
+}
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "main.tofu")
+			if err := os.WriteFile(file, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := Run(context.Background(), []string{file}, policies.FS)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var violations int
+			for _, violation := range result.Violations {
+				if violation.RuleID == "gcp/cis/2.1" {
+					violations++
+				}
+			}
+			if got := violations > 0; got != tt.wantViolation {
+				t.Errorf("gcp/cis/2.1 violation: got %t, want %t", got, tt.wantViolation)
+			}
+		})
 	}
 }
 
