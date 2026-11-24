@@ -21,7 +21,7 @@ _violation_2_11 := {
 _has_storage_iam_metric_with_alert if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), "storage.setIamPermissions")
+	lib.metric_filter_contains(resource, "storage.setIamPermissions")
 	metric_name := object.get(resource, "name", "")
 	count(metric_name) > 0
 	lib.alert_exists_for_metric(metric_name)

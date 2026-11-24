@@ -20,7 +20,7 @@ _violation_2_7 := {
 _has_custom_role_metric_with_alert if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), "iam_role")
+	lib.metric_filter_contains(resource, "iam_role")
 	metric_name := object.get(resource, "name", "")
 	count(metric_name) > 0
 	lib.alert_exists_for_metric(metric_name)

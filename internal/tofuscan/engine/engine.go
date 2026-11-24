@@ -377,6 +377,9 @@ func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) 
 	case map[string]interface{}:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
+			if hasUnresolvedExpression(typed[key]) {
+				return nil, false
+			}
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
@@ -395,22 +398,51 @@ func resourceForEachInstances(value interface{}) ([]resourceEachInstance, bool) 
 		return instances, true
 
 	case []interface{}:
-		instances := make([]resourceEachInstance, 0, len(typed))
-		for index, itemValue := range typed {
-			item, ok := ctyValueFromGo(itemValue)
-			if !ok {
+		values := make(map[string]struct{}, len(typed))
+		for _, item := range typed {
+			stringValue, ok := item.(string)
+			if !ok || hasUnresolvedExpression(stringValue) {
 				return nil, false
 			}
-			instances = append(instances, resourceEachInstance{
-				key:   cty.NumberIntVal(int64(index)),
-				value: item,
-			})
+			values[stringValue] = struct{}{}
+		}
+
+		keys := make([]string, 0, len(values))
+		for value := range values {
+			keys = append(keys, value)
+		}
+		sort.Strings(keys)
+
+		instances := make([]resourceEachInstance, 0, len(keys))
+		for _, value := range keys {
+			item := cty.StringVal(value)
+			instances = append(instances, resourceEachInstance{key: item, value: item})
 		}
 		return instances, true
 
 	default:
 		return nil, false
 	}
+}
+
+func hasUnresolvedExpression(value interface{}) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.Contains(typed, "${")
+	case []interface{}:
+		for _, item := range typed {
+			if hasUnresolvedExpression(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range typed {
+			if hasUnresolvedExpression(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func ctyValueFromGo(value interface{}) (cty.Value, bool) {
@@ -463,18 +495,15 @@ func applyResourceEachValue(value interface{}, instance resourceEachInstance, sy
 		if strings.HasPrefix(typed, "${") && strings.HasSuffix(typed, "}") {
 			expr := strings.TrimSuffix(strings.TrimPrefix(typed, "${"), "}")
 			parsed, diags := hclsyntax.ParseExpression([]byte(expr), "<tofuscan>", hcl.Pos{Line: 1, Column: 1})
-			if diags.HasErrors() {
-				return typed
+			if !diags.HasErrors() {
+				resolved, diags := parsed.Value(ctx)
+				if !diags.HasErrors() && resolved.IsKnown() && !resolved.IsNull() {
+					goValue, err := ctyToGo(resolved)
+					if err == nil {
+						return goValue
+					}
+				}
 			}
-			resolved, diags := parsed.Value(ctx)
-			if diags.HasErrors() || !resolved.IsKnown() || resolved.IsNull() {
-				return typed
-			}
-			goValue, err := ctyToGo(resolved)
-			if err != nil {
-				return typed
-			}
-			return goValue
 		}
 
 		template, diags := hclsyntax.ParseTemplate([]byte(typed), "<tofuscan>", hcl.Pos{Line: 1, Column: 1})

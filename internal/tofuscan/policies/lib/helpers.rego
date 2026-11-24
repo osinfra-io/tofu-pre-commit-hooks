@@ -9,14 +9,12 @@ is_public_cidr("0.0.0.0/0")
 
 is_public_cidr("::/0")
 
-# is_unresolved returns true when a field value is an unresolved HCL expression
-# (e.g. "${module.core_helpers.labels}"). The engine only resolves var.* and
-# local.* references; module.*, data.*, and each.* remain as literal strings
-# beginning with "${". Policies skip these values to avoid flagging legitimate
-# configurations whose value is supplied at apply time by a module output.
+# is_unresolved returns true when a field value contains an unresolved HCL
+# interpolation. The engine resolves known var.*, local.*, and each.* references;
+# remaining interpolations may depend on values supplied at apply time.
 is_unresolved(value) if {
 	is_string(value)
-	startswith(value, "${")
+	contains(value, "${")
 }
 
 # truthy normalizes the boolean-ish values that appear after HCL parsing. A field
@@ -63,7 +61,14 @@ is_sqlserver(resource) if startswith(object.get(resource, "database_version", ""
 metric_filter_exists(key_term) if {
 	some _label, resources in input.resource.google_logging_metric
 	some resource in resources
-	contains(object.get(resource, "filter", ""), key_term)
+	metric_filter_contains(resource, key_term)
+}
+
+# metric_filter_contains matches only statically known metric filters.
+metric_filter_contains(resource, key_term) if {
+	filter := object.get(resource, "filter", "")
+	not is_unresolved(filter)
+	contains(filter, key_term)
 }
 
 # alert_exists_for_metric returns true when at least one
@@ -73,11 +78,14 @@ metric_filter_exists(key_term) if {
 # from similarly-named metrics. Used by CIS 2.5–2.12 policies to verify that
 # an alerting policy exists for each required log metric.
 alert_exists_for_metric(metric_name) if {
+	not is_unresolved(metric_name)
 	some _label, resources in input.resource.google_monitoring_alert_policy
 	some resource in resources
 	some condition in object.get(resource, "conditions", [])
 	some threshold in object.get(condition, "condition_threshold", [])
-	contains(object.get(threshold, "filter", ""), $"metric.type=\"logging.googleapis.com/user/{metric_name}\"")
+	filter := object.get(threshold, "filter", "")
+	not is_unresolved(filter)
+	contains(filter, $"metric.type=\"logging.googleapis.com/user/{metric_name}\"")
 }
 
 # port_covered returns true when target (a number) is matched by any entry in

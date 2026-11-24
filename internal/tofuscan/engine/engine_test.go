@@ -313,9 +313,9 @@ resource "google_compute_instance" "vm2" {
 	index := resourceLineIndex(f)
 
 	cases := map[string]int{
-		"google_compute_instance.vm1":    1,
-		"google_storage_bucket.bucket":   5,
-		"google_compute_instance.vm2":    12,
+		"google_compute_instance.vm1":  1,
+		"google_storage_bucket.bucket": 5,
+		"google_compute_instance.vm2":  12,
 	}
 	for name, wantLine := range cases {
 		if gotLine := index[name]; gotLine != wantLine {
@@ -362,7 +362,6 @@ resource "google_storage_bucket" "this" {
 		t.Errorf("google_storage_bucket.this: got line %d, want 5", got)
 	}
 }
-
 
 func TestGlobalViolationFiresOnceAcrossFiles(t *testing.T) {
 	// When scanning multiple files where none defines a log sink,
@@ -699,7 +698,11 @@ func TestExpandDynamicBlocksUnresolvedPreserved(t *testing.T) {
 }
 
 func TestResourceForEachLogMetricsAndAlerts(t *testing.T) {
-	content := `locals {
+	content := `variable "enable_owner" {
+  type = bool
+}
+
+locals {
   metrics = {
     ownership  = "protoPayload.serviceData.policyDelta.bindingDeltas.role=\"roles/owner\""
     audit      = "protoPayload.serviceData.policyDelta.auditConfigDeltas:*"
@@ -712,7 +715,7 @@ func TestResourceForEachLogMetricsAndAlerts(t *testing.T) {
   }
   alert_filters = {
     for key, filter in local.metrics :
-    key => "metric.type=\"logging.googleapis.com/user/${key}\" AND resource.type=\"global\""
+    key => "metric.type=\"logging.googleapis.com/user/${key}-${filter}\" AND resource.type=\"global\""
   }
   without_ownership = {
     for key, filter in local.metrics : key => filter if key != "ownership"
@@ -727,7 +730,7 @@ resource "google_project" "example" {
 resource "google_logging_metric" "cis" {
   for_each = local.metrics
 
-  name    = each.key
+  name    = "${each.key}-${each.value}"
   filter  = each.value
   project = google_project.example.project_id
 }
@@ -778,8 +781,76 @@ resource "google_monitoring_alert_policy" "cis" {
 		},
 		{
 			name:        "mismatched alert filter",
-			content:     strings.Replace(content, `user/${key}`, `user/not-${key}`, 1),
+			content:     strings.Replace(content, `user/${key}-${filter}`, `user/not-${key}-${filter}`, 1),
 			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved value in known collection",
+			content: `variable "filter" {
+  type = string
+}
+
+locals {
+  alert_filter = "metric.type=\"logging.googleapis.com/user/ownership\""
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = { ownership = var.filter }
+  name     = each.key
+  filter   = each.value != "" ? "roles/owner" : "unrelated"
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = { ownership = "alert" }
+  conditions {
+    condition_threshold {
+      filter = local.alert_filter
+    }
+  }
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved metric filter",
+			content: strings.Replace(content,
+				`filter  = each.value`,
+				`filter  = each.key == "ownership" ? (var.enable_owner ? "roles/owner" : each.value) : each.value`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name: "string set for_each",
+			content: `variable "metrics" {
+  type    = set(string)
+  default = ["roles/owner", "auditConfigDeltas", "iam_role", "gce_firewall_rule", "gce_route", "gce_network", "storage.setIamPermissions", "cloudsql.instances.update"]
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = var.metrics
+  name     = each.key
+  filter   = each.value
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = var.metrics
+  conditions {
+    condition_threshold {
+      filter = "metric.type=\"logging.googleapis.com/user/${each.key}\""
+    }
+  }
+}
+`,
 		},
 		{
 			name: "unresolved resource for_each",
