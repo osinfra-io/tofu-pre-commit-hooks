@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/open-policy-agent/conftest/parser"
@@ -697,9 +698,157 @@ func TestExpandDynamicBlocksUnresolvedPreserved(t *testing.T) {
 	}
 }
 
+func TestResourceForEachLogMetricsAndAlerts(t *testing.T) {
+	content := `locals {
+  metrics = {
+    ownership  = "protoPayload.serviceData.policyDelta.bindingDeltas.role=\"roles/owner\""
+    audit      = "protoPayload.serviceData.policyDelta.auditConfigDeltas:*"
+    custom     = "iam_role"
+    firewall   = "gce_firewall_rule"
+    route      = "gce_route"
+    network    = "gce_network"
+    storage    = "storage.setIamPermissions"
+    sql        = "cloudsql.instances.update"
+  }
+  alert_filters = {
+    for key, filter in local.metrics :
+    key => "metric.type=\"logging.googleapis.com/user/${key}\" AND resource.type=\"global\""
+  }
+  without_ownership = {
+    for key, filter in local.metrics : key => filter if key != "ownership"
+  }
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = local.metrics
+
+  name    = each.key
+  filter  = each.value
+  project = google_project.example.project_id
+}
+
+resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.metrics
+
+  combiner     = "OR"
+  display_name = each.key
+  project      = google_project.example.project_id
+
+  conditions {
+    display_name = google_logging_metric.cis[each.key].name
+    condition_threshold {
+      comparison = "COMPARISON_GT"
+      duration   = "0s"
+      filter     = local.alert_filters[each.key]
+    }
+  }
+}
+`
+
+	tests := []struct {
+		name        string
+		content     string
+		wantRuleIDs []string
+	}{
+		{name: "all metric and alert instances match", content: content},
+		{
+			name: "missing metric",
+			content: strings.Replace(content,
+				`resource "google_logging_metric" "cis" {
+  for_each = local.metrics`,
+				`resource "google_logging_metric" "cis" {
+  for_each = local.without_ownership`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name: "missing alert",
+			content: strings.Replace(content,
+				`resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.metrics`,
+				`resource "google_monitoring_alert_policy" "cis" {
+  for_each = local.without_ownership`,
+				1),
+			wantRuleIDs: []string{"gcp/cis/2.5"},
+		},
+		{
+			name:        "mismatched alert filter",
+			content:     strings.Replace(content, `user/${key}`, `user/not-${key}`, 1),
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+		{
+			name: "unresolved resource for_each",
+			content: `variable "metrics" {
+  type = map(string)
+}
+
+resource "google_project" "example" {
+  name       = "example-project"
+  project_id = "example-project"
+}
+
+resource "google_logging_metric" "cis" {
+  for_each = var.metrics
+  name     = each.key
+  filter   = each.value
+}
+`,
+			wantRuleIDs: []string{"gcp/cis/2.5", "gcp/cis/2.6", "gcp/cis/2.7", "gcp/cis/2.8", "gcp/cis/2.9", "gcp/cis/2.10", "gcp/cis/2.11", "gcp/cis/2.12"},
+		},
+	}
+	rulesUnderTest := map[string]struct{}{
+		"gcp/cis/2.5":  {},
+		"gcp/cis/2.6":  {},
+		"gcp/cis/2.7":  {},
+		"gcp/cis/2.8":  {},
+		"gcp/cis/2.9":  {},
+		"gcp/cis/2.10": {},
+		"gcp/cis/2.11": {},
+		"gcp/cis/2.12": {},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			file := filepath.Join(tmp, "main.tofu")
+			if err := os.WriteFile(file, []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := Run(context.Background(), []string{file}, policies.FS)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var got []string
+			for _, violation := range result.Violations {
+				if _, ok := rulesUnderTest[violation.RuleID]; ok {
+					got = append(got, violation.RuleID)
+				}
+			}
+			sort.Strings(got)
+			want := append([]string(nil), tt.wantRuleIDs...)
+			sort.Strings(want)
+			if len(got) != len(want) {
+				t.Fatalf("CIS 2.5–2.12 violations: got %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("CIS 2.5–2.12 violations: got %v, want %v", got, want)
+					break
+				}
+			}
+		})
+	}
+}
+
 func TestNormalizeConfigResolvesReferencesAcrossFiles(t *testing.T) {
 	tmp := t.TempDir()
-
 	variables := `variable "release_channel" {
   default = "REGULAR"
 }
