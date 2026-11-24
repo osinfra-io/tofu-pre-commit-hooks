@@ -813,6 +813,50 @@ resource "google_project_iam_audit_config" "example" {
 			wantViolation: true,
 		},
 		{
+			name: "declared set variable default uses element keys",
+			content: `variable "audit_log_config_types" {
+  type    = set(string)
+  default = ["ADMIN_READ", "DATA_READ", "DATA_WRITE"]
+}
+
+resource "google_project_iam_audit_config" "example" {
+  project = "example-project"
+  service = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = var.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+		},
+		{
+			name: "set nested in resource each value retains member keys",
+			content: `locals {
+  projects = {
+    example = {
+      audit_log_config_types = toset(["ADMIN_READ", "DATA_READ", "DATA_WRITE"])
+    }
+  }
+}
+
+resource "google_project_iam_audit_config" "example" {
+  for_each = local.projects
+  project  = each.key
+  service  = "allServices"
+
+  dynamic "audit_log_config" {
+    for_each = each.value.audit_log_config_types
+    content {
+      log_type = audit_log_config.key
+    }
+  }
+}
+`,
+		},
+		{
 			name: "map keys with custom iterator",
 			content: `locals {
   audit_log_config_types = {
@@ -884,6 +928,123 @@ resource "google_project_iam_audit_config" "example" {
 				t.Errorf("gcp/cis/2.1 violation: got %t, want %t", got, tt.wantViolation)
 			}
 		})
+	}
+}
+
+func TestCIS5_1NestedSetResourceForEach(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "main.tofu")
+	content := `locals {
+  members = toset(["allUsers"])
+}
+
+resource "google_storage_bucket_iam_binding" "public" {
+  for_each = {
+    one = {
+      members = local.members
+    }
+  }
+
+  bucket  = "example"
+  role    = "roles/storage.objectViewer"
+  members = each.value.members
+}
+`
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Run(context.Background(), []string{file}, policies.FS)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, violation := range result.Violations {
+		if violation.RuleID == "gcp/cis/5.1" {
+			return
+		}
+	}
+	t.Fatal("expected gcp/cis/5.1 violation for nested public IAM member set")
+}
+
+func TestCtyGoConversionPreservesNestedSets(t *testing.T) {
+	nestedSet := cty.SetVal([]cty.Value{cty.StringVal("reader")})
+	value := cty.ObjectVal(map[string]cty.Value{
+		"nested": cty.ObjectVal(map[string]cty.Value{
+			"members": nestedSet,
+		}),
+		"nested_map": cty.MapVal(map[string]cty.Value{
+			"members": nestedSet,
+		}),
+	})
+
+	goValue, err := ctyToGo(value)
+	if err != nil {
+		t.Fatalf("ctyToGo: %v", err)
+	}
+	converted, ok := ctyValueFromGo(goValue)
+	if !ok {
+		t.Fatal("ctyValueFromGo failed")
+	}
+	members := converted.GetAttr("nested").GetAttr("members")
+	if !members.Type().IsSetType() {
+		t.Fatalf("nested members type: got %s, want set", members.Type().FriendlyName())
+	}
+	mapMembers := converted.GetAttr("nested_map").GetAttr("members")
+	if !mapMembers.Type().IsSetType() {
+		t.Fatalf("nested map members type: got %s, want set", mapMembers.Type().FriendlyName())
+	}
+
+	instance := resourceEachInstance{key: cty.StringVal("example"), value: converted}
+	symbols := &symbolTable{localValues: cty.EmptyObjectVal, variableValues: cty.EmptyObjectVal}
+	for _, path := range []string{"nested.members", "nested_map.members"} {
+		resolved := applyResourceEachValue("${each.value."+path+"}", instance, symbols)
+		instances, ok := dynamicForEachInstances(resolved)
+		if !ok || len(instances) != 1 || instances[0].key != "reader" {
+			t.Fatalf("%s dynamic instances: got %#v, want key/value reader", path, instances)
+		}
+	}
+}
+
+func TestExpandDynamicBlocksPreservesShadowedNestedIterator(t *testing.T) {
+	input := map[string]interface{}{
+		"dynamic": map[string]interface{}{
+			"parent": []interface{}{
+				map[string]interface{}{
+					"iterator": "outer",
+					"for_each": []interface{}{
+						map[string]interface{}{
+							"name":     "parent",
+							"children": []interface{}{map[string]interface{}{"name": "child"}},
+						},
+					},
+					"content": []interface{}{
+						map[string]interface{}{
+							"name": "${outer.value.name}",
+							"dynamic": map[string]interface{}{
+								"child": []interface{}{
+									map[string]interface{}{
+										"iterator": "outer",
+										"for_each": "${outer.value.children}",
+										"content": []interface{}{
+											map[string]interface{}{"name": "${outer.value.name}"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := expandDynamicBlocks(input).(map[string]interface{})
+	parent := got["parent"].([]interface{})[0].(map[string]interface{})
+	if parent["name"] != "parent" {
+		t.Fatalf("parent name: got %#v, want parent", parent["name"])
+	}
+	child := parent["child"].([]interface{})[0].(map[string]interface{})
+	if child["name"] != "child" {
+		t.Fatalf("child name: got %#v, want child", child["name"])
 	}
 }
 

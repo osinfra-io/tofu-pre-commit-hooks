@@ -13,11 +13,13 @@ import (
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/ext/typeexpr"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/open-policy-agent/conftest/parser"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 	ctyjson "github.com/zclconf/go-cty/cty/json"
 )
 
@@ -305,7 +307,8 @@ type resourceEachInstance struct {
 }
 
 type setValues struct {
-	values []interface{}
+	values      []interface{}
+	elementType cty.Type
 }
 
 func unwrapSetValues(value interface{}) interface{} {
@@ -481,19 +484,72 @@ func hasUnresolvedExpression(value interface{}) bool {
 }
 
 func ctyValueFromGo(value interface{}) (cty.Value, bool) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return cty.NilVal, false
+	switch typed := value.(type) {
+	case setValues:
+		elements := make([]cty.Value, 0, len(typed.values))
+		for _, item := range typed.values {
+			converted, ok := ctyValueFromGo(item)
+			if !ok {
+				return cty.NilVal, false
+			}
+			elements = append(elements, converted)
+		}
+		if len(elements) == 0 {
+			elementType := typed.elementType
+			if elementType == cty.NilType || elementType == cty.DynamicPseudoType {
+				elementType = cty.String
+			}
+			return cty.SetValEmpty(elementType), true
+		}
+		return cty.SetVal(elements), true
+	case map[string]interface{}:
+		if len(typed) == 0 {
+			return cty.EmptyObjectVal, true
+		}
+		attributes := make(map[string]cty.Value, len(typed))
+		for name, item := range typed {
+			converted, ok := ctyValueFromGo(item)
+			if !ok {
+				return cty.NilVal, false
+			}
+			attributes[name] = converted
+		}
+		return cty.ObjectVal(attributes), true
+	case []interface{}:
+		elements := make([]cty.Value, 0, len(typed))
+		for _, item := range typed {
+			converted, ok := ctyValueFromGo(item)
+			if !ok {
+				return cty.NilVal, false
+			}
+			elements = append(elements, converted)
+		}
+		return cty.TupleVal(elements), true
+	case string:
+		return cty.StringVal(typed), true
+	case bool:
+		return cty.BoolVal(typed), true
+	case int:
+		return cty.NumberIntVal(int64(typed)), true
+	case int64:
+		return cty.NumberIntVal(typed), true
+	case float64:
+		return cty.NumberFloatVal(typed), true
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return cty.NilVal, false
+		}
+		valueType, err := ctyjson.ImpliedType(encoded)
+		if err != nil {
+			return cty.NilVal, false
+		}
+		converted, err := ctyjson.Unmarshal(encoded, valueType)
+		if err != nil {
+			return cty.NilVal, false
+		}
+		return converted, true
 	}
-	valueType, err := ctyjson.ImpliedType(encoded)
-	if err != nil {
-		return cty.NilVal, false
-	}
-	converted, err := ctyjson.Unmarshal(encoded, valueType)
-	if err != nil {
-		return cty.NilVal, false
-	}
-	return converted, true
 }
 
 func applyResourceEachValue(value interface{}, instance resourceEachInstance, symbols *symbolTable) interface{} {
@@ -789,7 +845,11 @@ func applyEachValue(value interface{}, blockName string, key, item interface{}) 
 	case map[string]interface{}:
 		resolved := make(map[string]interface{}, len(typed))
 		for k, v := range typed {
-			resolved[k] = applyEachValue(v, blockName, key, item)
+			if k == "dynamic" {
+				resolved[k] = applyEachValueToDynamicBlocks(v, blockName, key, item)
+			} else {
+				resolved[k] = applyEachValue(v, blockName, key, item)
+			}
 		}
 		return resolved
 	case []interface{}:
@@ -801,6 +861,47 @@ func applyEachValue(value interface{}, blockName string, key, item interface{}) 
 	default:
 		return value
 	}
+}
+
+func applyEachValueToDynamicBlocks(value interface{}, blockName string, key, item interface{}) interface{} {
+	dynamicBlocks, ok := value.(map[string]interface{})
+	if !ok {
+		return applyEachValue(value, blockName, key, item)
+	}
+
+	resolved := make(map[string]interface{}, len(dynamicBlocks))
+	for nestedBlockName, entriesValue := range dynamicBlocks {
+		entries, ok := entriesValue.([]interface{})
+		if !ok {
+			resolved[nestedBlockName] = applyEachValue(entriesValue, blockName, key, item)
+			continue
+		}
+
+		resolvedEntries := make([]interface{}, len(entries))
+		for index, entryValue := range entries {
+			entry, ok := entryValue.(map[string]interface{})
+			if !ok {
+				resolvedEntries[index] = applyEachValue(entryValue, blockName, key, item)
+				continue
+			}
+
+			nestedIterator := nestedBlockName
+			if iterator, ok := entry["iterator"].(string); ok && iterator != "" {
+				nestedIterator = strings.TrimSuffix(strings.TrimPrefix(iterator, "${"), "}")
+			}
+			resolvedEntry := make(map[string]interface{}, len(entry))
+			for name, entryItem := range entry {
+				if name == "content" && nestedIterator == blockName {
+					resolvedEntry[name] = entryItem
+				} else {
+					resolvedEntry[name] = applyEachValue(entryItem, blockName, key, item)
+				}
+			}
+			resolvedEntries[index] = resolvedEntry
+		}
+		resolved[nestedBlockName] = resolvedEntries
+	}
+	return resolved
 }
 
 // buildDirSymbolTables groups the given files by directory and builds one
@@ -895,6 +996,15 @@ func collectVariableDefaults(body *hclsyntax.Body) map[string]cty.Value {
 			continue
 		}
 
+		if typeAttr, ok := block.Body.Attributes["type"]; ok {
+			constraint, typeDiags := typeexpr.TypeConstraint(typeAttr.Expr)
+			if !typeDiags.HasErrors() {
+				if constrained, err := convert.Convert(value, constraint); err == nil {
+					value = constrained
+				}
+			}
+		}
+
 		defaults[block.Labels[0]] = value
 	}
 
@@ -954,6 +1064,52 @@ func ctyMapToGo(values map[string]cty.Value) (map[string]interface{}, error) {
 }
 
 func ctyToGo(value cty.Value) (interface{}, error) {
+	if !value.IsKnown() {
+		return nil, fmt.Errorf("cannot convert an unknown cty value to Go")
+	}
+	if value.IsNull() {
+		return nil, nil
+	}
+
+	switch {
+	case value.Type().IsSetType():
+		values := make([]interface{}, 0, value.LengthInt())
+		iterator := value.ElementIterator()
+		for iterator.Next() {
+			_, element := iterator.Element()
+			converted, err := ctyToGo(element)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, converted)
+		}
+		return setValues{values: values, elementType: value.Type().ElementType()}, nil
+	case value.Type().IsListType(), value.Type().IsTupleType():
+		values := make([]interface{}, 0, value.LengthInt())
+		iterator := value.ElementIterator()
+		for iterator.Next() {
+			_, element := iterator.Element()
+			converted, err := ctyToGo(element)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, converted)
+		}
+		return values, nil
+	case value.Type().IsMapType(), value.Type().IsObjectType():
+		values := make(map[string]interface{}, value.LengthInt())
+		iterator := value.ElementIterator()
+		for iterator.Next() {
+			key, element := iterator.Element()
+			converted, err := ctyToGo(element)
+			if err != nil {
+				return nil, err
+			}
+			values[key.AsString()] = converted
+		}
+		return values, nil
+	}
+
 	encoded, err := ctyjson.Marshal(value, value.Type())
 	if err != nil {
 		return nil, err
@@ -1006,7 +1162,7 @@ func resolveReferenceString(value string, symbols *symbolTable) (interface{}, bo
 		}
 		if value, ok := lookupCtyReference(symbols.variableValues, path); ok && value.Type().IsSetType() {
 			if values, ok := resolved.([]interface{}); ok {
-				return setValues{values: values}, true
+				return setValues{values: values, elementType: value.Type().ElementType()}, true
 			}
 		}
 		return resolved, true
@@ -1018,7 +1174,7 @@ func resolveReferenceString(value string, symbols *symbolTable) (interface{}, bo
 		}
 		if value, ok := lookupCtyReference(symbols.localValues, path); ok && value.Type().IsSetType() {
 			if values, ok := resolved.([]interface{}); ok {
-				return setValues{values: values}, true
+				return setValues{values: values, elementType: value.Type().ElementType()}, true
 			}
 		}
 		return resolved, true
