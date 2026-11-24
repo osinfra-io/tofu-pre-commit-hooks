@@ -122,10 +122,13 @@ func TestPrint_MediumViolationUsesWarningBadge(t *testing.T) {
 
 func TestPrintSkippedViolationReason(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		reason string
-		want   string
+		name        string
+		description string
+		reason      string
+		want        string
 	}{
+		{name: "with description and reason", description: "Protect the control plane.", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n│\n│  Reason: Managed by the platform\n╰─\n"},
+		{name: "with description only", description: "Protect the control plane.", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n╰─\n"},
 		{name: "with reason", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Reason: Managed by the platform\n╰─\n"},
 		{name: "without reason", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n╰─\n"},
 	} {
@@ -133,7 +136,7 @@ func TestPrintSkippedViolationReason(t *testing.T) {
 			out := captureStdout(t, func() {
 				printSkippedViolation(engine.Violation{
 					RuleID: "gke/cis/5.6.4", CISControl: "5.6.4",
-					Title: "Cluster check", SkipReason: tt.reason,
+					Title: "Cluster check", Description: tt.description, SkipReason: tt.reason,
 				})
 			})
 			if out != tt.want {
@@ -183,6 +186,9 @@ func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
 		}},
 		{"passing", func() {
 			printPassingCard(&RuleMetadata{Title: "Success", Description: description})
+		}},
+		{"skipped", func() {
+			printSkippedViolation(engine.Violation{Title: "Skipped", Description: description})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

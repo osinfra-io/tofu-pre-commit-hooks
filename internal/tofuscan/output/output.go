@@ -83,6 +83,10 @@ func printSkippedViolation(v engine.Violation) {
 	c := output.NewCard(output.DarkGray)
 	c.Open(output.Badge("SKIPPED", output.DarkGray), output.Title(v.Title))
 	printCISLine(c, v.RuleID, v.CISControl, v.ProfileLevel, v.Severity)
+	if v.Description != "" {
+		c.Blank()
+		c.Paragraph(v.Description, output.Dim)
+	}
 	if v.SkipReason != "" {
 		c.Blank()
 		c.Paragraph("Reason: "+v.SkipReason, output.Dim)
