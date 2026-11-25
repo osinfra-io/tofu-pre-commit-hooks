@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"tofu-pre-commit-hooks/internal/output"
@@ -16,7 +18,7 @@ func main() {
 		os.Args[1:],
 		testutil.CheckOpenTofuInstalled,
 		os.Getwd,
-		hasTestFiles,
+		findTestDirs,
 		runTofuTest,
 		printStatus,
 	)
@@ -30,8 +32,8 @@ func RunTofuTestCLI(
 	extraArgs []string,
 	checkInstalled func() bool,
 	getwd func() (string, error),
-	hasTestFiles func(string) (bool, error),
-	runTest func(string, []string) (string, error),
+	findTestDirs func(string) ([]string, error),
+	runTest func(string, []string, string) (string, error),
 	printStatus func(string, string),
 ) error {
 	if !checkInstalled() {
@@ -45,23 +47,39 @@ func RunTofuTestCLI(
 		return err
 	}
 
-	hasTests, err := hasTestFiles(rootDir)
+	dirs, err := findTestDirs(rootDir)
 	if err != nil {
 		fmt.Printf("Error checking for test files: %v\n", err)
 		return err
 	}
 
-	if !hasTests {
+	if len(dirs) == 0 {
 		printStatus(output.Running, "No OpenTofu test files (.tftest.hcl) found, skipping tests.")
 		return nil
 	}
 
-	testOutput, err := runTest(rootDir, extraArgs)
-
-	if err != nil {
-		fmt.Println()
-		c := output.NewCard(output.Red)
-		c.Open(output.Badge("FAIL", output.BoldRed), output.Title("OpenTofu test"))
+	var testErrors []error
+	for _, dir := range dirs {
+		config, err := readTestConfig(dir)
+		var testOutput string
+		if err == nil {
+			args := append(config.Args, extraArgs...)
+			testOutput, err = runTest(dir, args, config.Workspace)
+		}
+		relPath, relErr := filepath.Rel(rootDir, dir)
+		if relErr != nil {
+			relPath = dir
+		}
+		color, badge, badgeColor := output.Green, "PASS", output.BoldGreen
+		if err != nil {
+			testErrors = append(testErrors, fmt.Errorf("%s: %w", relPath, err))
+			color, badge, badgeColor = output.Red, "FAIL", output.BoldRed
+			if strings.TrimSpace(testOutput) == "" {
+				testOutput = err.Error()
+			}
+		}
+		c := output.NewCard(color)
+		c.Open(output.Badge(badge, badgeColor), output.Title("OpenTofu test: "+relPath))
 		c.Blank()
 		for _, line := range strings.Split(testOutput, "\n") {
 			if strings.TrimSpace(line) != "" {
@@ -70,21 +88,11 @@ func RunTofuTestCLI(
 		}
 		c.Close()
 		fmt.Println()
+	}
+	if len(testErrors) > 0 {
 		printStatus(output.Error, "OpenTofu test failed.")
-		fmt.Println()
-		return fmt.Errorf("test failed: %w", err)
+		return fmt.Errorf("OpenTofu test failed: %w", errors.Join(testErrors...))
 	}
-
-	c := output.NewCard(output.Green)
-	c.Open(output.Badge("PASS", output.BoldGreen), output.Title("OpenTofu test"))
-	c.Blank()
-	for _, line := range strings.Split(testOutput, "\n") {
-		if strings.TrimSpace(line) != "" {
-			c.Line(fmt.Sprintf("%s%s%s", output.Dim, line, output.Reset))
-		}
-	}
-	c.Close()
-	fmt.Println()
 	return nil
 }
 
@@ -93,8 +101,8 @@ func printStatus(emoji, msg string) {
 	fmt.Println(output.EmojiColorText(emoji, msg, output.Green))
 }
 
-func hasTestFiles(rootDir string) (bool, error) {
-	found := false
+func findTestDirs(rootDir string) ([]string, error) {
+	dirs := make(map[string]bool)
 	cleanRoot := filepath.Clean(rootDir)
 	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -110,20 +118,34 @@ func hasTestFiles(rootDir string) (bool, error) {
 		}
 
 		if strings.HasSuffix(info.Name(), ".tftest.hcl") {
-			found = true
-			return filepath.SkipAll
+			dir := filepath.Dir(path)
+			if filepath.Base(dir) == "tests" && dir != cleanRoot {
+				dir = filepath.Dir(dir)
+			}
+			dirs[dir] = true
 		}
 
 		return nil
 	})
 
-	return found, err
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		result = append(result, dir)
+	}
+	slices.Sort(result)
+	return result, nil
 }
 
-func runTofuTest(dir string, extraArgs []string) (string, error) {
+func runTofuTest(dir string, extraArgs []string, workspace string) (string, error) {
 	args := append([]string{"test"}, extraArgs...)
 	cmd := exec.Command("tofu", args...)
 	cmd.Dir = dir
+	if workspace != "" {
+		cmd.Env = append(cmd.Environ(), "TF_WORKSPACE="+workspace)
+	}
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
