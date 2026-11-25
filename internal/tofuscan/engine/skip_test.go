@@ -242,29 +242,6 @@ resource "google_storage_bucket" "bucket" {
 	}
 }
 
-func TestCountBraces(t *testing.T) {
-	cases := []struct {
-		line string
-		want int
-	}{
-		{`resource "a" "b" {`, 1},
-		{`}`, -1},
-		{`  metadata = {}`, 0},
-		{`  # comment with { braces }`, 0},
-		{`  // comment with { braces }`, 0},
-		{`  name = "value with { braces }"`, 0},
-		{`  name = "escaped \" still { in string"`, 0},
-		{`  block { # comment with }`, 1},
-		{`  name = "}"`, 0},
-	}
-	for _, tc := range cases {
-		got := countBraces(tc.line)
-		if got != tc.want {
-			t.Errorf("countBraces(%q) = %d, want %d", tc.line, got, tc.want)
-		}
-	}
-}
-
 func TestParseFileSkipsSameLabelDifferentTypes(t *testing.T) {
 	// Two resources share the label "this" but have different types.
 	// A skip inside one block must not apply to the other.
@@ -296,5 +273,52 @@ resource "google_storage_bucket" "this" {
 	bucketSkips := resourceLevel["google_storage_bucket.this"]
 	if len(bucketSkips) != 0 {
 		t.Errorf("expected no skips for 'google_storage_bucket.this', got %v", bucketSkips)
+	}
+}
+
+func TestParseFileSkipsHCLCommentsAndResourceBoundaries(t *testing.T) {
+	content := `resource "a" "empty" {}
+# tofu-scan skip: CIS 1.1
+/*
+resource "a" "commented" {
+  # tofu-scan skip: CIS 1.2
+}
+*/
+resource "a" "real" {
+  script = <<-SCRIPT
+    }
+    # tofu-scan skip: CIS 1.3
+  SCRIPT
+  /*
+  }
+  # tofu-scan skip: CIS 1.4
+  */
+  name = "test" # tofu-scan skip: CIS 1.5
+  nested {
+    # tofu-scan skip: CIS 1.6 - nested reason
+  }
+}
+# tofu-scan skip: CIS 1.7
+`
+	path := filepath.Join(t.TempDir(), "main.tofu")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skips := readFileSkips(t, path)
+	if len(skips) != 1 || len(skips["a.real"]) != 1 || skips["a.real"]["1.6"] != "nested reason" {
+		t.Fatalf("unexpected skips: %#v", skips)
+	}
+}
+
+func TestParseFileSkipsLongLine(t *testing.T) {
+	content := "resource \"a\" \"long\" {\n  value = \"" + strings.Repeat("x", 70000) +
+		"\"\n  # tofu-scan skip: CIS 1.1 - long string is acceptable\n}\n"
+	path := filepath.Join(t.TempDir(), "main.tofu")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skips := readFileSkips(t, path)
+	if skips["a.long"]["1.1"] != "long string is acceptable" {
+		t.Fatalf("expected skip after long line, got %#v", skips)
 	}
 }
