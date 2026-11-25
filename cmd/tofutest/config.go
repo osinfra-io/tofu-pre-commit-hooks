@@ -2,12 +2,13 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.yaml.in/yaml/v3"
 )
 
 type testConfig struct {
@@ -16,7 +17,7 @@ type testConfig struct {
 }
 
 func readTestConfig(dir string) (testConfig, error) {
-	path := filepath.Join(dir, ".tofu-test.json")
+	path := filepath.Join(dir, ".tofu-test.yaml")
 	if _, err := os.Lstat(path); err != nil {
 		if os.IsNotExist(err) {
 			return testConfig{}, nil
@@ -28,40 +29,47 @@ func readTestConfig(dir string) (testConfig, error) {
 		return testConfig{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 
-	var fields struct {
-		Workspace json.RawMessage `json:"workspace"`
-		Args      json.RawMessage `json:"args"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if len(bytes.TrimSpace(data)) == 0 || bytes.TrimSpace(data)[0] != '{' {
-		return testConfig{}, fmt.Errorf("%s: configuration must be a JSON object", path)
-	}
-	if err := decoder.Decode(&fields); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
 		return testConfig{}, fmt.Errorf("%s: invalid configuration: %w", path, err)
 	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
+	if err := decoder.Decode(new(yaml.Node)); err != io.EOF {
 		return testConfig{}, fmt.Errorf("%s: unexpected data after configuration", path)
 	}
-
-	var config testConfig
-	if fields.Workspace != nil {
-		if bytes.Equal(bytes.TrimSpace(fields.Workspace), []byte("null")) || json.Unmarshal(fields.Workspace, &config.Workspace) != nil ||
-			strings.TrimSpace(config.Workspace) == "" || strings.TrimSpace(config.Workspace) != config.Workspace {
-			return testConfig{}, fmt.Errorf("%s: workspace must be a non-empty string without surrounding whitespace", path)
-		}
+	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return testConfig{}, fmt.Errorf("%s: configuration must be a YAML mapping", path)
 	}
-	if fields.Args != nil {
-		var args []json.RawMessage
-		if bytes.Equal(bytes.TrimSpace(fields.Args), []byte("null")) || json.Unmarshal(fields.Args, &args) != nil {
-			return testConfig{}, fmt.Errorf("%s: args must be an array of non-empty strings", path)
+	var config testConfig
+	seen := make(map[string]bool)
+	fields := document.Content[0].Content
+	for i := 0; i < len(fields); i += 2 {
+		key, value := fields[i], fields[i+1]
+		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			return testConfig{}, fmt.Errorf("%s: configuration keys must be strings", path)
 		}
-		for _, raw := range args {
-			var arg string
-			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &arg) != nil || arg == "" {
-				return testConfig{}, fmt.Errorf("%s: args must be an array of non-empty strings", path)
+		if seen[key.Value] {
+			return testConfig{}, fmt.Errorf("%s: duplicate field %q", path, key.Value)
+		}
+		seen[key.Value] = true
+		switch key.Value {
+		case "workspace":
+			if value.Kind != yaml.ScalarNode || value.Tag != "!!str" || strings.TrimSpace(value.Value) == "" || strings.TrimSpace(value.Value) != value.Value {
+				return testConfig{}, fmt.Errorf("%s: workspace must be a non-empty string without surrounding whitespace", path)
 			}
-			config.Args = append(config.Args, arg)
+			config.Workspace = value.Value
+		case "args":
+			if value.Kind != yaml.SequenceNode {
+				return testConfig{}, fmt.Errorf("%s: args must be a list of non-empty strings", path)
+			}
+			for _, arg := range value.Content {
+				if arg.Kind != yaml.ScalarNode || arg.Tag != "!!str" || arg.Value == "" {
+					return testConfig{}, fmt.Errorf("%s: args must be a list of non-empty strings", path)
+				}
+				config.Args = append(config.Args, arg.Value)
+			}
+		default:
+			return testConfig{}, fmt.Errorf("%s: unknown field %q", path, key.Value)
 		}
 	}
 	return config, nil

@@ -171,7 +171,7 @@ func TestRunTofuTestCLI_ReportsPassingDirectoriesBeforeFailures(t *testing.T) {
 		}
 		dirs = append(dirs, dir)
 	}
-	if err := os.WriteFile(filepath.Join(dirs[2], ".tofu-test.json"), []byte("{"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirs[2], ".tofu-test.yaml"), []byte("workspace: ["), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	out, err := os.CreateTemp(t.TempDir(), "output")

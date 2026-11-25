@@ -19,24 +19,27 @@ func TestReadTestConfig(t *testing.T) {
 		invalid bool
 	}{
 		{name: "empty object", content: `{}`},
-		{name: "configured", content: `{"workspace":"sandbox","args":["-var-file=../teams.tfvars","-var","environment=sandbox"]}`,
+		{name: "configured", content: "workspace: sandbox\nargs:\n  - -var-file=../teams.tfvars\n  - -var\n  - environment=sandbox\n",
 			want: testConfig{Workspace: "sandbox", Args: []string{"-var-file=../teams.tfvars", "-var", "environment=sandbox"}}},
-		{name: "syntax", content: `{"workspace":`, invalid: true},
+		{name: "syntax", content: `workspace: [`, invalid: true},
 		{name: "not object", content: `null`, invalid: true},
-		{name: "unknown field", content: `{"workpace":"sandbox"}`, invalid: true},
-		{name: "trailing data", content: `{} {}`, invalid: true},
-		{name: "null workspace", content: `{"workspace":null}`, invalid: true},
-		{name: "blank workspace", content: `{"workspace":" "}`, invalid: true},
-		{name: "non-string workspace", content: `{"workspace":2}`, invalid: true},
-		{name: "null args", content: `{"args":null}`, invalid: true},
-		{name: "wrong args", content: `{"args":"-verbose"}`, invalid: true},
-		{name: "null argument", content: `{"args":[null]}`, invalid: true},
-		{name: "empty argument", content: `{"args":[""]}`, invalid: true},
+		{name: "empty document", content: "", invalid: true},
+		{name: "unknown field", content: `workpace: sandbox`, invalid: true},
+		{name: "duplicate field", content: "workspace: first\nworkspace: second\n", invalid: true},
+		{name: "multiple documents", content: "{}\n---\n{}", invalid: true},
+		{name: "null workspace", content: `workspace: null`, invalid: true},
+		{name: "blank workspace", content: `workspace: " "`, invalid: true},
+		{name: "non-string workspace", content: `workspace: 2`, invalid: true},
+		{name: "null args", content: `args: null`, invalid: true},
+		{name: "wrong args", content: `args: -verbose`, invalid: true},
+		{name: "null argument", content: `args: [null]`, invalid: true},
+		{name: "non-string argument", content: `args: [true]`, invalid: true},
+		{name: "empty argument", content: `args: [""]`, invalid: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
-			path := filepath.Join(dir, ".tofu-test.json")
+			path := filepath.Join(dir, ".tofu-test.yaml")
 			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +62,7 @@ func TestReadTestConfigMissingAndUnreadable(t *testing.T) {
 	if got, err := readTestConfig(dir); err != nil || !reflect.DeepEqual(got, testConfig{}) {
 		t.Fatalf("missing config = %#v, %v", got, err)
 	}
-	path := filepath.Join(dir, ".tofu-test.json")
+	path := filepath.Join(dir, ".tofu-test.yaml")
 	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +85,9 @@ case "$PWD" in *e-fail) echo "intentional failure"; exit 1;; esac
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("TF_WORKSPACE", "inherited")
 	configs := map[string]string{
-		"a-invalid":    `{"workspace":null}`,
-		"b-configured": `{"workspace":"sandbox","args":["-var-file=../teams.tfvars","-var=env=local"]}`,
-		"c-configured": `{"workspace":"regional","args":["-var-file","../regional.tfvars"]}`,
+		"a-invalid":    "workspace: null\n",
+		"b-configured": "workspace: sandbox\nargs: [-var-file=../teams.tfvars, -var=env=local]\n",
+		"c-configured": "workspace: regional\nargs: [-var-file, ../regional.tfvars]\n",
 		"d-inherited":  "",
 		"e-fail":       "",
 	}
@@ -95,7 +98,7 @@ case "$PWD" in *e-fail) echo "intentional failure"; exit 1;; esac
 			t.Fatal(err)
 		}
 		if configs[name] != "" {
-			if err := os.WriteFile(filepath.Join(dir, ".tofu-test.json"), []byte(configs[name]), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, ".tofu-test.yaml"), []byte(configs[name]), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -159,7 +162,7 @@ run "check" {
   }
 }
 `,
-		"module/.tofu-test.json": `{"workspace":"sandbox","args":["-var-file=../teams.tfvars","-var=priority=directory"]}`,
+		"module/.tofu-test.yaml": "workspace: sandbox\nargs: [-var-file=../teams.tfvars, -var=priority=directory]\n",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {

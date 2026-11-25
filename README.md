@@ -104,13 +104,13 @@ Runs OpenTofu automated tests defined in `.tftest.hcl` files.
 
 `-filter` selects a test file relative to each test module directory. Both equals-form and split-form flags are supported; for split form, include the flag and its value as separate list entries. `-verbose` controls the level of detail `tofu test` itself emits.
 
-Optionally place `.tofu-test.json` in a test module directory to configure that suite:
+Optionally place `.tofu-test.yaml` in a test module directory to configure that suite:
 
-```json
-{
-  "workspace": "assembly-main-sandbox",
-  "args": ["-var-file=environments/sandbox.tfvars", "-var-file=../foundation/teams/factory.tfvars"]
-}
+```yaml
+workspace: assembly-main-sandbox
+args:
+  - -var-file=environments/sandbox.tfvars
+  - -var-file=../foundation/teams/factory.tfvars
 ```
 
 Both fields are optional. `workspace` sets `TF_WORKSPACE` only for that suite; without it, the inherited environment is unchanged. The workspace must already exist, and the hook does not initialize dependencies. Arguments are passed directly to `tofu test` without shell expansion, with paths such as `-var-file` relative to the test module directory. Shared hook arguments follow these arguments, so OpenTofu applies its usual precedence (for example, later variable assignments override earlier ones). Invalid or unreadable configuration fails the hook. Tests may create real infrastructure; these settings do not bypass workspace validation.
