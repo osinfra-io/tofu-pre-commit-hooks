@@ -5,8 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
+
+	"tofu-pre-commit-hooks/internal/output"
 	"tofu-pre-commit-hooks/internal/testutil"
 )
 
@@ -154,6 +158,88 @@ func TestRunTofuTestCLI_RunsEveryDirectoryAfterFailure(t *testing.T) {
 	}
 	if !reflect.DeepEqual(visited, dirs) {
 		t.Errorf("visited %v, want %v", visited, dirs)
+	}
+}
+
+func TestRunTofuTestCLI_ReportsPassingDirectoriesBeforeFailures(t *testing.T) {
+	root := t.TempDir()
+	var dirs []string
+	for _, name := range []string{"a-fail", "b-pass", "c-invalid", "d-pass", "e-fail"} {
+		dir := filepath.Join(root, name)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, dir)
+	}
+	if err := os.WriteFile(filepath.Join(dirs[2], ".tofu-test.json"), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.CreateTemp(t.TempDir(), "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := out.Close(); err != nil {
+			t.Errorf("close output: %v", err)
+		}
+	}()
+	originalStdout := os.Stdout
+	os.Stdout = out
+	defer func() { os.Stdout = originalStdout }()
+
+	var emoji, summary string
+	runErr := RunTofuTestCLI(
+		nil,
+		func() bool { return true },
+		func() (string, error) { return root, nil },
+		func(string) ([]string, error) { return dirs, nil },
+		func(dir string, _ []string, _ string) (string, error) {
+			if strings.HasSuffix(dir, "-fail") {
+				return "test failure details", errors.New("test failure")
+			}
+			return "test passed", nil
+		},
+		func(e, msg string) { emoji, summary = e, msg },
+	)
+	if runErr == nil {
+		t.Fatal("expected failures")
+	}
+	if emoji != output.Error || summary != "2/5 test directories passed  ·  3 failed" {
+		t.Errorf("summary = %q %q", emoji, summary)
+	}
+	data, err := os.ReadFile(out.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := ansi.Strip(string(data))
+	last := -1
+	for _, expected := range []string{
+		"[PASS] OpenTofu test: b-pass", "[PASS] OpenTofu test: d-pass",
+		"[FAIL] OpenTofu test: a-fail", "[FAIL] OpenTofu test: c-invalid", "[FAIL] OpenTofu test: e-fail",
+	} {
+		pos := strings.Index(text, expected)
+		if pos <= last {
+			t.Fatalf("missing or out-of-order %q in:\n%s", expected, text)
+		}
+		last = pos
+	}
+	if !strings.Contains(text, "test failure details") || !strings.Contains(text, "invalid configuration") {
+		t.Errorf("expected test and configuration diagnostics in:\n%s", text)
+	}
+}
+
+func TestRunTofuTestCLI_SuccessSummary(t *testing.T) {
+	var emoji, summary string
+	err := RunTofuTestCLI(
+		nil,
+		func() bool { return true },
+		func() (string, error) { return "/fake", nil },
+		func(string) ([]string, error) { return []string{"/fake/a", "/fake/b"}, nil },
+		func(string, []string, string) (string, error) { return "passed", nil },
+		func(e, msg string) { emoji, summary = e, msg },
+	)
+	if err != nil || emoji != output.ThumbsUp || summary != "2/2 test directories passed" {
+		t.Errorf("result = %v, %q %q", err, emoji, summary)
 	}
 }
 
