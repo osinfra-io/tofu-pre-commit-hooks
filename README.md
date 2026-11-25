@@ -17,7 +17,7 @@ Runs `tofu fmt` to rewrite your OpenTofu (`.tf`, `.tofu`, `.tfvars`) files to a 
 
 #### Validates OpenTofu configuration files
 
-Runs `tofu validate` to check your configuration for syntax errors and internal consistency, without accessing remote services or APIs. This helps catch mistakes before applying changes. It will not validate files in `.terraform/` directories.
+Runs `tofu validate` to check your configuration for syntax errors and internal consistency without accessing remote state or provider APIs. By default, the hook first runs `tofu init -backend=false`, which may download providers and modules. It will not validate files in `.terraform/` directories.
 
 ### tofu-lint
 
@@ -35,13 +35,15 @@ Both hooks check up to four directories concurrently, limited by available CPUs,
 
 #### Runs OpenTofu automated tests
 
-Runs `tofu test` to execute automated tests defined in `.tftest.hcl` files. This helps validate your infrastructure code with comprehensive test coverage, ensuring your configurations behave as expected. Tests are executed in the root directory only. The hook will skip execution if no test files are found.
+Runs `tofu test` from the repository root when it finds a `.tftest.hcl` file outside hidden directories. It does not run `tofu test` separately in each subdirectory. OpenTofu tests can create real infrastructure unless configured to use plan-only runs or mocks.
 
 ### tofu-scan
 
 #### Checks OpenTofu files against CIS benchmarks
 
-Runs `tofuscan` to check your OpenTofu (`.tofu`) files against CIS benchmark policies using OPA/Rego. Covers [CIS Google Cloud Platform Foundation Benchmark v5.0.0](docs/tofuscan/cis-gcp-v5.0.0.md) and [CIS Google Kubernetes Engine (GKE) Benchmark v1.8.0](docs/tofuscan/cis-gke-v1.8.0.md). It will not scan files in `.terraform/` directories.
+Runs `tofuscan` to check your OpenTofu (`.tofu`) files against CIS benchmark policies using OPA/Rego. Covers [CIS Google Cloud Platform Foundation Benchmark v5.0.0](docs/tofuscan/cis-gcp-v5.0.0.md) and [CIS Google Kubernetes Engine (GKE) Benchmark v1.8.0](docs/tofuscan/cis-gke-v1.8.0.md). It recursively scans `.tofu` files from the repository root, not just changed files, and skips hidden directories including `.terraform/`. The hook is triggered by changes to `.tofu` files; it does not scan `.tf` or `.tfvars` files.
+
+The scan analyzes configuration, not deployed resources. Project-level existence checks combine all scanned files rather than isolating individual projects, so a resource in one project can satisfy a check for another.
 
 ---
 
@@ -95,12 +97,12 @@ Runs OpenTofu automated tests defined in `.tftest.hcl` files.
     - id: tofu-test
       # verbose: true                # show hook output on success
       # Optional: pass additional args to tofu test
-      # args: ["-verbose"]            # show per-assertion output
-      # args: ["-filter=TestFoo"]     # equals-form flag
-      # args: ["-filter", "TestFoo"]  # split-form flag (both tokens required)
+      # args: ["-verbose"]                             # show each test run's plan or state
+      # args: ["-filter=tests/example.tftest.hcl"]     # equals-form flag
+      # args: ["-filter", "tests/example.tftest.hcl"]  # split-form flag
 ```
 
-Both equals-form (`-filter=TestFoo`) and split-form (`-filter TestFoo`) flags are supported. When using split-form flags, include both the flag and its value as separate list entries. `-verbose` controls the level of detail `tofu test` itself emits.
+`-filter` selects a test file relative to the repository root. Both equals-form and split-form flags are supported; for split form, include the flag and its value as separate list entries. `-verbose` controls the level of detail `tofu test` itself emits.
 
 ### Example: `tofu-scan`
 
