@@ -3,7 +3,7 @@
 [![Go Tests](https://img.shields.io/github/actions/workflow/status/osinfra-io/tofu-pre-commit-hooks/go-test.yml?style=for-the-badge&logo=go&color=00ADD8&label=Go%20Tests)](https://github.com/osinfra-io/tofu-pre-commit-hooks/actions/workflows/go-test.yml)
 [![Dependabot](https://img.shields.io/github/actions/workflow/status/osinfra-io/tofu-pre-commit-hooks/dependabot.yml?style=for-the-badge&logo=github&color=2088FF&label=Dependabot)](https://github.com/osinfra-io/tofu-pre-commit-hooks/actions/workflows/dependabot.yml)
 
-This repository contains a collection of hooks for Infrastructure as Code (IaC) tools. The hooks are designed to be used with [pre-commit](https://pre-commit.com/), a framework for managing and maintaining multi-language pre-commit hooks.
+This repository contains [pre-commit](https://pre-commit.com/) hooks for OpenTofu configuration.
 
 ## Available Hooks
 
