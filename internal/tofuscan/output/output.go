@@ -89,7 +89,7 @@ func printSkippedViolation(v engine.Violation) {
 	}
 	if v.SkipReason != "" {
 		c.Blank()
-		c.Paragraph("Reason: "+v.SkipReason, output.Dim)
+		c.Paragraph("Skip reason: "+v.SkipReason, output.Dim)
 	}
 	c.Close()
 }

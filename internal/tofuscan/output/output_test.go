@@ -127,9 +127,9 @@ func TestPrintSkippedViolationReason(t *testing.T) {
 		reason      string
 		want        string
 	}{
-		{name: "with description and reason", description: "Protect the control plane.", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n│\n│  Reason: Managed by the platform\n╰─\n"},
+		{name: "with description and reason", description: "Protect the control plane.", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n│\n│  Skip reason: Managed by the platform\n╰─\n"},
 		{name: "with description only", description: "Protect the control plane.", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n╰─\n"},
-		{name: "with reason", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Reason: Managed by the platform\n╰─\n"},
+		{name: "with reason", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Skip reason: Managed by the platform\n╰─\n"},
 		{name: "without reason", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n╰─\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,7 +154,7 @@ func TestPrintSkippedViolationWrapsReason(t *testing.T) {
 			Title: "Cluster check", SkipReason: reason,
 		})
 	})
-	if !strings.Contains(out, "\n│  Reason: ") || strings.Count(out, "\n│  ") < 3 {
+	if !strings.Contains(out, "\n│  Skip reason: ") || strings.Count(out, "\n│  ") < 3 {
 		t.Fatalf("expected a wrapped reason in the card:\n%s", out)
 	}
 	if strings.Count(out, "access.") != 8 {
