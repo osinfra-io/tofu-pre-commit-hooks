@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,7 @@ func main() {
 		os.Args[1:],
 		testutil.CheckOpenTofuInstalled,
 		os.Getwd,
-		hasTestFiles,
+		findTestDirs,
 		runTofuTest,
 		printStatus,
 	)
@@ -30,8 +31,8 @@ func RunTofuTestCLI(
 	extraArgs []string,
 	checkInstalled func() bool,
 	getwd func() (string, error),
-	hasTestFiles func(string) (bool, error),
-	runTest func(string, []string) (string, error),
+	findTestDirs func(string, []string) ([]string, error),
+	runTest func(string, []string, string) (string, error),
 	printStatus func(string, string),
 ) error {
 	if !checkInstalled() {
@@ -45,85 +46,93 @@ func RunTofuTestCLI(
 		return err
 	}
 
-	hasTests, err := hasTestFiles(rootDir)
+	dirs, err := findTestDirs(rootDir, extraArgs)
 	if err != nil {
 		fmt.Printf("Error checking for test files: %v\n", err)
 		return err
 	}
 
-	if !hasTests {
-		printStatus(output.Running, "No OpenTofu test files (.tftest.hcl) found, skipping tests.")
+	if len(dirs) == 0 {
+		printStatus(output.Running, "No OpenTofu test files (.tftest.hcl) found in configured test directories, skipping tests.")
 		return nil
 	}
 
-	testOutput, err := runTest(rootDir, extraArgs)
+	type testResult struct {
+		path   string
+		output string
+		err    error
+	}
+	var passed, failed []testResult
+	var testErrors []error
+	for _, dir := range dirs {
+		config, err := readTestConfig(dir)
+		var testOutput string
+		if err == nil {
+			if _, argErr := testDirectory(config.Args); argErr != nil {
+				err = fmt.Errorf("%s: %w", filepath.Join(dir, ".tofu-test.yaml"), argErr)
+			}
+		}
+		if err == nil {
+			args := append(config.Args, extraArgs...)
+			testOutput, err = runTest(dir, args, config.Workspace)
+		}
+		relPath, relErr := filepath.Rel(rootDir, dir)
+		if relErr != nil {
+			relPath = dir
+		}
+		if err != nil {
+			testErrors = append(testErrors, fmt.Errorf("%s: %w", relPath, err))
+			if strings.TrimSpace(testOutput) == "" {
+				testOutput = err.Error()
+			}
+			failed = append(failed, testResult{relPath, testOutput, err})
+		} else {
+			passed = append(passed, testResult{relPath, testOutput, nil})
+		}
+	}
 
-	if err != nil {
-		fmt.Println()
-		c := output.NewCard(output.Red)
-		c.Open(output.Badge("FAIL", output.BoldRed), output.Title("OpenTofu test"))
+	for _, result := range append(passed, failed...) {
+		color, badge, badgeColor := output.Green, "PASS", output.BoldGreen
+		if result.err != nil {
+			color, badge, badgeColor = output.Red, "FAIL", output.BoldRed
+		}
+		c := output.NewCard(color)
+		c.Open(output.Badge(badge, badgeColor), output.Title("OpenTofu test: "+result.path))
 		c.Blank()
-		for _, line := range strings.Split(testOutput, "\n") {
+		for _, line := range strings.Split(result.output, "\n") {
 			if strings.TrimSpace(line) != "" {
 				c.Line(fmt.Sprintf("%s%s%s", output.Dim, line, output.Reset))
 			}
 		}
 		c.Close()
 		fmt.Println()
-		printStatus(output.Error, "OpenTofu test failed.")
-		fmt.Println()
-		return fmt.Errorf("test failed: %w", err)
 	}
-
-	c := output.NewCard(output.Green)
-	c.Open(output.Badge("PASS", output.BoldGreen), output.Title("OpenTofu test"))
-	c.Blank()
-	for _, line := range strings.Split(testOutput, "\n") {
-		if strings.TrimSpace(line) != "" {
-			c.Line(fmt.Sprintf("%s%s%s", output.Dim, line, output.Reset))
-		}
+	summary := fmt.Sprintf("%d/%d test directories passed", len(passed), len(dirs))
+	if len(testErrors) > 0 {
+		summary += fmt.Sprintf("  ·  %d failed", len(failed))
+		printStatus(output.Error, summary)
+		return fmt.Errorf("OpenTofu test failed: %w", errors.Join(testErrors...))
 	}
-	c.Close()
-	fmt.Println()
+	printStatus(output.ThumbsUp, summary)
 	return nil
 }
 
 // printStatus prints a colored emoji status message
 func printStatus(emoji, msg string) {
-	fmt.Println(output.EmojiColorText(emoji, msg, output.Green))
+	color := output.Green
+	if emoji == output.Error {
+		color = output.Red
+	}
+	fmt.Println(output.EmojiColorText(emoji, msg, color))
 }
 
-func hasTestFiles(rootDir string) (bool, error) {
-	found := false
-	cleanRoot := filepath.Clean(rootDir)
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir() {
-			name := info.Name()
-			if filepath.Clean(path) != cleanRoot && strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if strings.HasSuffix(info.Name(), ".tftest.hcl") {
-			found = true
-			return filepath.SkipAll
-		}
-
-		return nil
-	})
-
-	return found, err
-}
-
-func runTofuTest(dir string, extraArgs []string) (string, error) {
+func runTofuTest(dir string, extraArgs []string, workspace string) (string, error) {
 	args := append([]string{"test"}, extraArgs...)
 	cmd := exec.Command("tofu", args...)
 	cmd.Dir = dir
+	if workspace != "" {
+		cmd.Env = append(cmd.Environ(), "TF_WORKSPACE="+workspace)
+	}
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }

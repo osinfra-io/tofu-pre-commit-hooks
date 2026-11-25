@@ -35,7 +35,7 @@ Both hooks check up to four directories concurrently, limited by available CPUs,
 
 #### Runs OpenTofu automated tests
 
-Runs `tofu test` from the repository root when it finds a `.tftest.hcl` file outside hidden directories. It does not run `tofu test` separately in each subdirectory. OpenTofu tests can create real infrastructure unless configured to use plan-only runs or mocks.
+Runs `tofu test` in each directory with `.tftest.hcl` files in the directory itself or its `tests/` subdirectory, excluding hidden directories. Dependencies must already be initialized. OpenTofu tests can create real infrastructure unless configured to use plan-only runs or mocks.
 
 ### tofu-scan
 
@@ -102,7 +102,20 @@ Runs OpenTofu automated tests defined in `.tftest.hcl` files.
       # args: ["-filter", "tests/example.tftest.hcl"]  # split-form flag
 ```
 
-`-filter` selects a test file relative to the repository root. Both equals-form and split-form flags are supported; for split form, include the flag and its value as separate list entries. `-verbose` controls the level of detail `tofu test` itself emits.
+`-filter` selects a test file relative to each test module directory. Both equals-form and split-form flags are supported; for split form, include the flag and its value as separate list entries. `-verbose` controls the level of detail `tofu test` itself emits.
+
+Optionally place `.tofu-test.yaml` in a test module directory to configure that suite:
+
+```yaml
+workspace: assembly-main-sandbox
+args:
+  - -var-file=environments/sandbox.tfvars
+  - -var-file=../foundation/teams/factory.tfvars
+```
+
+Both fields are optional. `workspace` sets `TF_WORKSPACE` only for that suite; without it, the inherited environment is unchanged. The workspace must already exist, and the hook does not initialize dependencies. Arguments are passed directly to `tofu test` without shell expansion, with paths such as `-var-file` relative to the test module directory. Shared hook arguments follow these arguments, so OpenTofu applies its usual precedence (for example, later variable assignments override earlier ones). Invalid or unreadable configuration fails the hook. Tests may create real infrastructure; these settings do not bypass workspace validation.
+
+Set `-test-directory` in the module's `args` or shared hook arguments to discover tests outside the default `tests/` directory. Shared arguments take precedence; the custom directory must be within the repository and outside hidden directories for the hook to discover it.
 
 ### Example: `tofu-scan`
 
