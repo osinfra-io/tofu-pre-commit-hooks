@@ -1,9 +1,14 @@
 package engine
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
+
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 )
 
 // SkipDirectives holds parsed skip comments from source files.
@@ -22,28 +27,33 @@ type SkipDirectives struct {
 //	}
 //
 // Comments outside resource blocks are ignored.
-func ParseSkipDirectives(files []string) *SkipDirectives {
+func ParseSkipDirectives(files []string) (*SkipDirectives, error) {
 	sd := &SkipDirectives{
 		resourceLevel: make(map[string]map[string]map[string]string),
 	}
 	seen := make(map[string]bool)
+	var errs []error
 	for _, file := range files {
 		if seen[file] || file == "" {
 			continue
 		}
 		seen[file] = true
-		resLvl := parseFileSkips(file)
+		resLvl, err := parseFileSkips(file)
+		if err != nil {
+			errs = append(errs, err)
+		}
 		if len(resLvl) > 0 {
 			sd.resourceLevel[file] = resLvl
 		}
 	}
-	return sd
+	return sd, errors.Join(errs...)
 }
 
 // Filter partitions violations into kept and skipped based on skip directives.
 func (sd *SkipDirectives) Filter(violations []Violation) (kept, skipped []Violation) {
 	for _, v := range violations {
-		if sd.shouldSkip(v) {
+		if reason, ok := sd.skipReason(v); ok {
+			v.SkipReason = reason
 			skipped = append(skipped, v)
 		} else {
 			kept = append(kept, v)
@@ -52,112 +62,82 @@ func (sd *SkipDirectives) Filter(violations []Violation) (kept, skipped []Violat
 	return kept, skipped
 }
 
-func (sd *SkipDirectives) shouldSkip(v Violation) bool {
+func (sd *SkipDirectives) skipReason(v Violation) (string, bool) {
 	if resSkips, ok := sd.resourceLevel[v.File]; ok {
 		if skips, ok := resSkips[v.Resource]; ok {
-			if _, ok := skips[v.CISControl]; ok {
-				return true
+			if reason, ok := skips[v.CISControl]; ok {
+				return reason, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
-// parseFileSkips scans a single file for skip comments inside resource blocks
-// using lightweight brace tracking. Skip comments outside resource blocks
-// are ignored.
-func parseFileSkips(file string) map[string]map[string]string {
+// parseFileSkips scans a single file for skip comments inside resource blocks.
+func parseFileSkips(file string) (map[string]map[string]string, error) {
 	resourceLevel := make(map[string]map[string]string)
 
-	f, err := os.Open(file)
+	source, err := os.ReadFile(file)
 	if err != nil {
-		return resourceLevel
-	}
-	defer func() { _ = f.Close() }()
-
-	var (
-		currentResource string
-		braceDepth      int
-	)
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		trimmed := strings.TrimSpace(scanner.Text())
-
-		// Check for skip comment — only relevant inside a resource block.
-		if currentResource != "" {
-			if control, reason := parseSkipComment(trimmed); control != "" {
-				if resourceLevel[currentResource] == nil {
-					resourceLevel[currentResource] = make(map[string]string)
-				}
-				resourceLevel[currentResource][control] = reason
-				continue
-			}
-		}
-
-		// Check for resource declaration (only at top level).
-		if braceDepth == 0 && strings.HasPrefix(trimmed, "resource ") {
-			parts := strings.Fields(trimmed)
-			if len(parts) >= 3 {
-				rtype := strings.Trim(parts[1], `"`)
-				rname := strings.Trim(parts[2], `"{}`)
-				currentResource = rtype + "." + rname
-				braceDepth += countBraces(trimmed)
-				continue
-			}
-		}
-
-		// Track brace depth for resource blocks.
-		if currentResource != "" {
-			braceDepth += countBraces(trimmed)
-			if braceDepth <= 0 {
-				currentResource = ""
-				braceDepth = 0
-			}
-		}
+		return nil, fmt.Errorf("read skip directives in %s: %w", file, err)
 	}
 
-	return resourceLevel
-}
+	start := hcl.Pos{Line: 1, Column: 1}
+	parsed, diags := hclsyntax.ParseConfig(source, file, start)
+	if diags.HasErrors() {
+		return nil, fmt.Errorf("parse skip directives in %s: %s", file, diags.Error())
+	}
+	tokens, diags := hclsyntax.LexConfig(source, file, start)
+	if diags.HasErrors() {
+		return nil, fmt.Errorf("lex skip directives in %s: %s", file, diags.Error())
+	}
 
-// countBraces returns the net brace count ({minus}) for a line, ignoring
-// braces inside comments and quoted strings.
-func countBraces(line string) int {
-	n := 0
-	inString := false
-	for i := 0; i < len(line); i++ {
-		ch := line[i]
-		if inString {
-			switch ch {
-			case '\\':
-				i++ // skip escaped character
-			case '"':
-				inString = false
-			}
+	var errs []error
+	tokenIndex := 0
+	for _, block := range parsed.Body.(*hclsyntax.Body).Blocks {
+		if block.Type != "resource" || len(block.Labels) != 2 {
 			continue
 		}
-		switch ch {
-		case '"':
-			inString = true
-		case '#':
-			return n // rest of line is a comment
-		case '/':
-			if i+1 < len(line) && line[i+1] == '/' {
-				return n // rest of line is a comment
+		resource := block.Labels[0] + "." + block.Labels[1]
+		for tokenIndex < len(tokens) && tokens[tokenIndex].Range.Start.Byte < block.CloseBraceRange.Start.Byte {
+			token := tokens[tokenIndex]
+			tokenIndex++
+			if token.Type != hclsyntax.TokenComment || token.Range.Start.Byte <= block.OpenBraceRange.Start.Byte {
+				continue
 			}
-		case '{':
-			n++
-		case '}':
-			n--
+			lineStart := bytes.LastIndexByte(source[:token.Range.Start.Byte], '\n') + 1
+			if strings.TrimSpace(string(source[lineStart:token.Range.Start.Byte])) != "" || !isSkipComment(string(token.Bytes)) {
+				continue
+			}
+			control, reason := parseSkipComment(string(token.Bytes))
+			if control == "" || reason == "" {
+				errs = append(errs, fmt.Errorf("%s:%d: skip directive requires a CIS control and a non-empty reason: # tofu-scan skip: CIS <control> - <reason>", file, token.Range.Start.Line))
+				continue
+			}
+			if resourceLevel[resource] == nil {
+				resourceLevel[resource] = make(map[string]string)
+			}
+			resourceLevel[resource][control] = reason
 		}
 	}
-	return n
+
+	return resourceLevel, errors.Join(errs...)
 }
 
-// parseSkipComment extracts a CIS control and optional reason from a skip
+func isSkipComment(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "#") {
+		return false
+	}
+	line = strings.TrimSpace(line[1:])
+	const prefix = "tofu-scan skip:"
+	return len(line) >= len(prefix) && strings.EqualFold(line[:len(prefix)], prefix)
+}
+
+// parseSkipComment extracts a CIS control and reason from a skip
 // comment. Returns empty strings if the line is not a skip comment.
 //
-// Format: # tofu-scan skip: CIS <control> [- <reason>]
+// Format: # tofu-scan skip: CIS <control> - <reason>
 func parseSkipComment(line string) (control, reason string) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "#") {
@@ -184,7 +164,7 @@ func parseSkipComment(line string) (control, reason string) {
 	}
 	control = parts[0]
 
-	// Extract optional reason after "-".
+	// Extract reason after "-".
 	if len(parts) > 1 {
 		remainder := strings.TrimSpace(parts[1])
 		if strings.HasPrefix(remainder, "- ") {

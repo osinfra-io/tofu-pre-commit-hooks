@@ -120,6 +120,61 @@ func TestPrint_MediumViolationUsesWarningBadge(t *testing.T) {
 	}
 }
 
+func TestPrintSkippedViolationReason(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		description string
+		reason      string
+		want        string
+	}{
+		{name: "with description and reason", description: "Protect the control plane.", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n│\n│  Skip reason: Managed by the platform\n╰─\n"},
+		{name: "with description only", description: "Protect the control plane.", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Protect the control plane.\n╰─\n"},
+		{name: "with reason", reason: "Managed by the platform", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n│\n│  Skip reason: Managed by the platform\n╰─\n"},
+		{name: "without reason", want: "╭─ [SKIPPED] Cluster check\n│  🏷  Cluster Networking · GKE CIS 5.6.4\n╰─\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				printSkippedViolation(engine.Violation{
+					RuleID: "gke/cis/5.6.4", CISControl: "5.6.4",
+					Title: "Cluster check", Description: tt.description, SkipReason: tt.reason,
+				})
+			})
+			if out != tt.want {
+				t.Errorf("got %q, want %q", out, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintSkippedViolationWrapsReason(t *testing.T) {
+	reason := strings.Repeat("Required for authorized access. ", 8)
+	out := captureStdout(t, func() {
+		printSkippedViolation(engine.Violation{
+			RuleID: "gke/cis/5.6.4", CISControl: "5.6.4",
+			Title: "Cluster check", SkipReason: reason,
+		})
+	})
+	if !strings.Contains(out, "\n│  Skip reason: ") || strings.Count(out, "\n│  ") < 3 {
+		t.Fatalf("expected a wrapped reason in the card:\n%s", out)
+	}
+	if strings.Count(out, "access.") != 8 {
+		t.Fatalf("reason was lost or split:\n%s", out)
+	}
+}
+
+func TestPrintSeparatesSkippedCards(t *testing.T) {
+	skipped := []engine.Violation{
+		{RuleID: "gke/cis/5.6.3", CISControl: "5.6.3", Title: "First"},
+		{RuleID: "gke/cis/5.6.4", CISControl: "5.6.4", Title: "Second"},
+	}
+	out := captureStdout(t, func() {
+		Print(nil, skipped, nil)
+	})
+	if !strings.Contains(out, "╰─\n\n╭─ [SKIPPED] Second") {
+		t.Fatalf("expected blank line between skipped cards:\n%s", out)
+	}
+}
+
 func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
 	description := strings.Repeat("More detail about this failure. ", 10)
 	for _, tc := range []struct {
@@ -131,6 +186,9 @@ func TestDescriptionWrapsAtWordBoundaries(t *testing.T) {
 		}},
 		{"passing", func() {
 			printPassingCard(&RuleMetadata{Title: "Success", Description: description})
+		}},
+		{"skipped", func() {
+			printSkippedViolation(engine.Violation{Title: "Skipped", Description: description})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

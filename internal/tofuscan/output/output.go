@@ -63,14 +63,12 @@ func Print(violations []engine.Violation, skipped []engine.Violation, resourceTy
 		printed = true
 	}
 
-	// Print skipped violations in light gray.
-	if len(skipped) > 0 {
+	// Print skipped violation cards.
+	for _, v := range skipped {
 		if printed {
 			fmt.Println()
 		}
-		for _, v := range skipped {
-			printSkippedViolation(v)
-		}
+		printSkippedViolation(v)
 		printed = true
 	}
 
@@ -82,14 +80,18 @@ func Print(violations []engine.Violation, skipped []engine.Violation, resourceTy
 }
 
 func printSkippedViolation(v engine.Violation) {
-	benchmark := "GCP CIS"
-	if strings.HasPrefix(v.RuleID, "gke/") {
-		benchmark = "GKE CIS"
+	c := output.NewCard(output.DarkGray)
+	c.Open(output.Badge("SKIPPED", output.DarkGray), output.Title(v.Title))
+	printCISLine(c, v.RuleID, v.CISControl, v.ProfileLevel, v.Severity)
+	if v.Description != "" {
+		c.Blank()
+		c.Paragraph(v.Description, output.Dim)
 	}
-	fmt.Printf("%s── [SKIPPED] %s · %s %s%s\n",
-		output.DarkGray, v.Title,
-		benchmark, v.CISControl, output.Reset,
-	)
+	if v.SkipReason != "" {
+		c.Blank()
+		c.Paragraph("Skip reason: "+v.SkipReason, output.Dim)
+	}
+	c.Close()
 }
 
 func printSummary(violations, skipped []engine.Violation, resourceTypes map[string]struct{}) {

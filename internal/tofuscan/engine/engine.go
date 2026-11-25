@@ -35,6 +35,7 @@ type Violation struct {
 	Severity     string `json:"severity"`
 	Title        string `json:"title"`
 	Description  string `json:"description"`
+	SkipReason   string `json:"skip_reason,omitempty"`
 }
 
 type symbolTable struct {

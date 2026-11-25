@@ -63,7 +63,7 @@ func RunTofuScanCLI(
 	warnOnly bool,
 	findFiles func([]string) ([]string, error),
 	runEngine func([]string) (*engine.RunResult, error),
-	parseSkips func([]string) *engine.SkipDirectives,
+	parseSkips func([]string) (*engine.SkipDirectives, error),
 	printOutput func([]engine.Violation, []engine.Violation, map[string]struct{}),
 	exit func(int),
 ) error {
@@ -80,6 +80,13 @@ func RunTofuScanCLI(
 		return nil
 	}
 
+	skips, err := parseSkips(files)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing skip directives: %v\n", err)
+		exit(exitError)
+		return err
+	}
+
 	result, err := runEngine(files)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error evaluating policies: %v\n", err)
@@ -87,7 +94,6 @@ func RunTofuScanCLI(
 		return err
 	}
 
-	skips := parseSkips(files)
 	violations, skipped := skips.Filter(result.Violations)
 
 	printOutput(violations, skipped, result.ResourceTypes)

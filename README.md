@@ -3,7 +3,7 @@
 [![Go Tests](https://img.shields.io/github/actions/workflow/status/osinfra-io/tofu-pre-commit-hooks/go-test.yml?style=for-the-badge&logo=go&color=00ADD8&label=Go%20Tests)](https://github.com/osinfra-io/tofu-pre-commit-hooks/actions/workflows/go-test.yml)
 [![Dependabot](https://img.shields.io/github/actions/workflow/status/osinfra-io/tofu-pre-commit-hooks/dependabot.yml?style=for-the-badge&logo=github&color=2088FF&label=Dependabot)](https://github.com/osinfra-io/tofu-pre-commit-hooks/actions/workflows/dependabot.yml)
 
-This repository contains a collection of hooks for Infrastructure as Code (IaC) tools. The hooks are designed to be used with [pre-commit](https://pre-commit.com/), a framework for managing and maintaining multi-language pre-commit hooks.
+This repository contains [pre-commit](https://pre-commit.com/) hooks for OpenTofu configuration.
 
 ## Available Hooks
 
@@ -132,7 +132,7 @@ resource "google_compute_firewall" "allow_ssh" {
 }
 ```
 
-The format is `# tofu-scan skip: CIS <control> [- <reason>]`. Skip comments placed outside a resource block are ignored. Skipped violations appear in the output summary so they remain visible.
+The format is `# tofu-scan skip: CIS <control> - <reason>`; a non-empty reason is required and shown in the skipped output. Invalid skip comments inside resource blocks fail the scan, including with `--warn-only`. Skip comments placed outside a resource block are ignored. Project-level findings cannot be skipped this way because they are not attached to a specific resource. Skipped violations appear in the output summary so they remain visible.
 
 Replace `<release-or-commit-sha>` with the desired version or commit hash.
 
