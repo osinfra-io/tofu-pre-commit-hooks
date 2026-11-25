@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -22,6 +23,7 @@ type globalSkip struct {
 	reason string
 	file   string
 	line   int
+	info   os.FileInfo
 }
 
 // ParseSkipDirectives scans the given files for tofu-scan skip comments.
@@ -91,7 +93,16 @@ func (sd *SkipDirectives) skipReason(v Violation) (string, bool) {
 func parseFileSkips(file string, globalLevel map[string]globalSkip) (map[string]map[string]string, error) {
 	resourceLevel := make(map[string]map[string]string)
 
-	source, err := os.ReadFile(file)
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("read skip directives in %s: %w", file, err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat skip directives in %s: %w", file, err)
+	}
+	source, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("read skip directives in %s: %w", file, err)
 	}
@@ -114,6 +125,7 @@ func parseFileSkips(file string, globalLevel map[string]globalSkip) (map[string]
 		}
 		lineStart := bytes.LastIndexByte(source[:token.Range.Start.Byte], '\n') + 1
 		if strings.TrimSpace(string(source[lineStart:token.Range.Start.Byte])) != "" {
+			errs = append(errs, fmt.Errorf("%s:%d: skip-global directive must be on its own line at the top level", file, token.Range.Start.Line))
 			continue
 		}
 		insideBlock := false
@@ -139,10 +151,13 @@ func parseFileSkips(file string, globalLevel map[string]globalSkip) (map[string]
 			continue
 		}
 		if previous, ok := globalLevel[control]; ok {
+			if previous.line == token.Range.Start.Line && previous.reason == reason && os.SameFile(previous.info, info) {
+				continue
+			}
 			errs = append(errs, fmt.Errorf("%s:%d: duplicate skip-global directive for CIS %s (already declared at %s:%d)", file, token.Range.Start.Line, control, previous.file, previous.line))
 			continue
 		}
-		globalLevel[control] = globalSkip{reason: reason, file: file, line: token.Range.Start.Line}
+		globalLevel[control] = globalSkip{reason: reason, file: file, line: token.Range.Start.Line, info: info}
 	}
 	tokenIndex := 0
 	for _, block := range body.Blocks {

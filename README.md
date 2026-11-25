@@ -134,7 +134,7 @@ resource "google_compute_firewall" "allow_ssh" {
 
 The format is `# tofu-scan skip: CIS <control> - <reason>`; a non-empty reason is required and shown in the skipped output. Invalid skip comments inside resource blocks fail the scan, including with `--warn-only`. Resource skip comments placed outside a resource block are ignored.
 
-To skip a project-level finding, place a separate global directive at the top level of any scanned `.tofu` file:
+To skip a project-level finding, place a global directive on its own line at the top level of any scanned `.tofu` file:
 
 ```hcl
 # tofu-scan skip-global: CIS 1.17 - Essential Contacts are managed at the organization level

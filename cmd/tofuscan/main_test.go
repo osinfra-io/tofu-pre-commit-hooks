@@ -10,6 +10,7 @@ import (
 
 	"tofu-pre-commit-hooks/internal/tofuscan/engine"
 	"tofu-pre-commit-hooks/internal/tofuscan/policies"
+	"tofu-pre-commit-hooks/internal/tofuscan/walker"
 )
 
 func TestRunTofuScanCLI(t *testing.T) {
@@ -195,6 +196,7 @@ func TestRunTofuScanCLIGlobalSkip(t *testing.T) {
 	}{
 		{name: "global finding skipped", directive: "# tofu-scan skip-global: CIS 1.17 - Managed at organization level"},
 		{name: "missing reason fails with warn-only", directive: "# tofu-scan skip-global: CIS 1.17", wantErr: true},
+		{name: "inline directive fails with warn-only", directive: "variable \"example\" {} # tofu-scan skip-global: CIS 1.17", wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "main.tofu")
@@ -202,6 +204,7 @@ func TestRunTofuScanCLIGlobalSkip(t *testing.T) {
 			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 				t.Fatal(err)
 			}
+
 			exitCode := exitSuccess
 			var skipped []engine.Violation
 			err := RunTofuScanCLI(
@@ -224,5 +227,28 @@ func TestRunTofuScanCLIGlobalSkip(t *testing.T) {
 				t.Fatalf("unexpected skips %+v, error %v, exit %d", skipped, err, exitCode)
 			}
 		})
+	}
+}
+
+func TestRunTofuScanCLIRepeatedFilePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.tofu")
+	content := "# tofu-scan skip-global: CIS 1.17 - Managed at organization level\nresource \"google_project\" \"this\" {}\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var skipped []engine.Violation
+	err := RunTofuScanCLI(
+		[]string{dir, dir + "/./main.tofu"}, true,
+		walker.FindTofuFiles,
+		func(files []string) (*engine.RunResult, error) {
+			return engine.Run(context.Background(), files, policies.FS)
+		},
+		engine.ParseSkipDirectives,
+		func(_ []engine.Violation, got []engine.Violation, _ map[string]struct{}) { skipped = got },
+		func(code int) { t.Errorf("unexpected exit code %d", code) },
+	)
+	if err != nil || len(skipped) != 1 || skipped[0].RuleID != "gcp/cis/1.17" {
+		t.Fatalf("expected one skipped finding, got %+v and %v", skipped, err)
 	}
 }
