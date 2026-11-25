@@ -115,6 +115,8 @@ args:
 
 Both fields are optional. `workspace` sets `TF_WORKSPACE` only for that suite; without it, the inherited environment is unchanged. The workspace must already exist, and the hook does not initialize dependencies. Arguments are passed directly to `tofu test` without shell expansion, with paths such as `-var-file` relative to the test module directory. Shared hook arguments follow these arguments, so OpenTofu applies its usual precedence (for example, later variable assignments override earlier ones). Invalid or unreadable configuration fails the hook. Tests may create real infrastructure; these settings do not bypass workspace validation.
 
+Set `-test-directory` in the module's `args` or shared hook arguments to discover tests outside the default `tests/` directory. Shared arguments take precedence; the custom directory must be within the repository and outside hidden directories for the hook to discover it.
+
 ### Example: `tofu-scan`
 
 Checks OpenTofu files against CIS Google Cloud Foundations Benchmark policies using OPA/Rego. Covers CIS Google Cloud Platform Foundation Benchmark v5.0.0 and CIS Google Kubernetes Engine (GKE) Benchmark v1.8.0.

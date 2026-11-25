@@ -17,7 +17,7 @@ import (
 func TestRunTofuTestCLI_TofuNotInstalled(t *testing.T) {
 	checkInstalled := func() bool { return false }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return []string{"/fake"}, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return []string{"/fake"}, nil }
 	runTest := func(string, []string, string) (string, error) { return "", nil }
 	printStatus := func(string, string) {}
 
@@ -31,7 +31,7 @@ func TestRunTofuTestCLI_TofuNotInstalled(t *testing.T) {
 func TestRunTofuTestCLI_GetwdError(t *testing.T) {
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "", errors.New("getwd failed") }
-	findTestDirs := func(string) ([]string, error) { return []string{"/fake"}, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return []string{"/fake"}, nil }
 	runTest := func(string, []string, string) (string, error) { return "", nil }
 	printStatus := func(string, string) {}
 
@@ -45,7 +45,7 @@ func TestRunTofuTestCLI_GetwdError(t *testing.T) {
 func TestRunTofuTestCLI_NoTestFiles(t *testing.T) {
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return nil, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return nil, nil }
 	runTest := func(string, []string, string) (string, error) { return "", nil }
 	printStatus := func(string, string) {}
 
@@ -59,7 +59,7 @@ func TestRunTofuTestCLI_NoTestFiles(t *testing.T) {
 func TestRunTofuTestCLI_HasTestFilesError(t *testing.T) {
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return nil, errors.New("walk error") }
+	findTestDirs := func(string, []string) ([]string, error) { return nil, errors.New("walk error") }
 	runTest := func(string, []string, string) (string, error) { return "", nil }
 	printStatus := func(string, string) {}
 
@@ -73,7 +73,7 @@ func TestRunTofuTestCLI_HasTestFilesError(t *testing.T) {
 func TestRunTofuTestCLI_TestSuccess(t *testing.T) {
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return []string{"/fake"}, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return []string{"/fake"}, nil }
 	runTest := func(string, []string, string) (string, error) { return "All tests passed", nil }
 	printStatus := func(string, string) {}
 
@@ -89,7 +89,7 @@ func TestRunTofuTestCLI_TestFailure(t *testing.T) {
 
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return []string{"/fake"}, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return []string{"/fake"}, nil }
 	runTest := func(string, []string, string) (string, error) { return "Test failed", rootCause }
 	printStatus := func(string, string) {}
 
@@ -108,7 +108,7 @@ func TestRunTofuTestCLI_ExtraArgs(t *testing.T) {
 
 	checkInstalled := func() bool { return true }
 	getwd := func() (string, error) { return "/fake", nil }
-	findTestDirs := func(string) ([]string, error) { return []string{"/fake"}, nil }
+	findTestDirs := func(string, []string) ([]string, error) { return []string{"/fake"}, nil }
 	runTest := func(dir string, args []string, workspace string) (string, error) {
 		receivedArgs = args
 		return "Tests passed", nil
@@ -140,7 +140,7 @@ func TestRunTofuTestCLI_RunsEveryDirectoryAfterFailure(t *testing.T) {
 		[]string{"-verbose"},
 		func() bool { return true },
 		func() (string, error) { return "/fake", nil },
-		func(string) ([]string, error) { return dirs, nil },
+		func(string, []string) ([]string, error) { return dirs, nil },
 		func(dir string, args []string, workspace string) (string, error) {
 			visited = append(visited, dir)
 			if !reflect.DeepEqual(args, []string{"-verbose"}) {
@@ -192,7 +192,7 @@ func TestRunTofuTestCLI_ReportsPassingDirectoriesBeforeFailures(t *testing.T) {
 		nil,
 		func() bool { return true },
 		func() (string, error) { return root, nil },
-		func(string) ([]string, error) { return dirs, nil },
+		func(string, []string) ([]string, error) { return dirs, nil },
 		func(dir string, _ []string, _ string) (string, error) {
 			if strings.HasSuffix(dir, "-fail") {
 				return "test failure details", errors.New("test failure")
@@ -234,7 +234,7 @@ func TestRunTofuTestCLI_SuccessSummary(t *testing.T) {
 		nil,
 		func() bool { return true },
 		func() (string, error) { return "/fake", nil },
-		func(string) ([]string, error) { return []string{"/fake/a", "/fake/b"}, nil },
+		func(string, []string) ([]string, error) { return []string{"/fake/a", "/fake/b"}, nil },
 		func(string, []string, string) (string, error) { return "passed", nil },
 		func(e, msg string) { emoji, summary = e, msg },
 	)
@@ -259,7 +259,7 @@ func TestFindTestDirs_ModuleLayouts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := findTestDirs(root)
+	got, err := findTestDirs(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestHasTestFiles_WithTestFiles(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	got, err := findTestDirs(tempDir)
+	got, err := findTestDirs(tempDir, nil)
 	if err != nil {
 		t.Fatalf("hasTestFiles() returned error: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestHasTestFiles_WithoutTestFiles(t *testing.T) {
 		t.Fatalf("Failed to create tf file: %v", err)
 	}
 
-	got, err := findTestDirs(tempDir)
+	got, err := findTestDirs(tempDir, nil)
 	if err != nil {
 		t.Fatalf("hasTestFiles() returned error: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestHasTestFiles_InSubdirectory(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	got, err := findTestDirs(tempDir)
+	got, err := findTestDirs(tempDir, nil)
 	if err != nil {
 		t.Fatalf("hasTestFiles() returned error: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestHasTestFiles_SkipsHiddenDirectories(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	got, err := findTestDirs(tempDir)
+	got, err := findTestDirs(tempDir, nil)
 	if err != nil {
 		t.Fatalf("hasTestFiles() returned error: %v", err)
 	}

@@ -109,7 +109,7 @@ case "$PWD" in *e-fail) echo "intentional failure"; exit 1;; esac
 		[]string{"-var=env=shared", "-no-color"},
 		func() bool { return true },
 		func() (string, error) { return root, nil },
-		func(string) ([]string, error) { return dirs, nil },
+		func(string, []string) ([]string, error) { return dirs, nil },
 		runTofuTest,
 		func(string, string) {},
 	)

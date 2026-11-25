@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"tofu-pre-commit-hooks/internal/output"
@@ -32,7 +31,7 @@ func RunTofuTestCLI(
 	extraArgs []string,
 	checkInstalled func() bool,
 	getwd func() (string, error),
-	findTestDirs func(string) ([]string, error),
+	findTestDirs func(string, []string) ([]string, error),
 	runTest func(string, []string, string) (string, error),
 	printStatus func(string, string),
 ) error {
@@ -47,14 +46,14 @@ func RunTofuTestCLI(
 		return err
 	}
 
-	dirs, err := findTestDirs(rootDir)
+	dirs, err := findTestDirs(rootDir, extraArgs)
 	if err != nil {
 		fmt.Printf("Error checking for test files: %v\n", err)
 		return err
 	}
 
 	if len(dirs) == 0 {
-		printStatus(output.Running, "No OpenTofu test files (.tftest.hcl) found, skipping tests.")
+		printStatus(output.Running, "No OpenTofu test files (.tftest.hcl) found in configured test directories, skipping tests.")
 		return nil
 	}
 
@@ -68,6 +67,11 @@ func RunTofuTestCLI(
 	for _, dir := range dirs {
 		config, err := readTestConfig(dir)
 		var testOutput string
+		if err == nil {
+			if _, argErr := testDirectory(config.Args); argErr != nil {
+				err = fmt.Errorf("%s: %w", filepath.Join(dir, ".tofu-test.yaml"), argErr)
+			}
+		}
 		if err == nil {
 			args := append(config.Args, extraArgs...)
 			testOutput, err = runTest(dir, args, config.Workspace)
@@ -120,44 +124,6 @@ func printStatus(emoji, msg string) {
 		color = output.Red
 	}
 	fmt.Println(output.EmojiColorText(emoji, msg, color))
-}
-
-func findTestDirs(rootDir string) ([]string, error) {
-	dirs := make(map[string]bool)
-	cleanRoot := filepath.Clean(rootDir)
-	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir() {
-			name := info.Name()
-			if filepath.Clean(path) != cleanRoot && strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if strings.HasSuffix(info.Name(), ".tftest.hcl") {
-			dir := filepath.Dir(path)
-			if filepath.Base(dir) == "tests" && dir != cleanRoot {
-				dir = filepath.Dir(dir)
-			}
-			dirs[dir] = true
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	result := make([]string, 0, len(dirs))
-	for dir := range dirs {
-		result = append(result, dir)
-	}
-	slices.Sort(result)
-	return result, nil
 }
 
 func runTofuTest(dir string, extraArgs []string, workspace string) (string, error) {
