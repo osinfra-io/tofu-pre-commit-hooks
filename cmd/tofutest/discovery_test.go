@@ -76,6 +76,29 @@ func TestFindTestDirs_CustomDirectoriesAndModulesNamedTests(t *testing.T) {
 			files: map[string]string{"module/.tofu-test.yaml": "args: [-test-directory]\n", "module/checks/check.tftest.hcl": "", "other/main.tf": "", "other/check.tftest.hcl": ""},
 			want:  []string{"module", "other"},
 		},
+		{
+			name: "invalid root config preserves independent modules",
+			files: map[string]string{
+				".tofu-test.yaml":                 "args: [\n",
+				"module/main.tf":                  "",
+				"module/tests/check.tftest.hcl":   "",
+				"custom/.tofu-test.yaml":          "args: [-test-directory=checks]\n",
+				"custom/checks/check.tftest.hcl":  "",
+				"unknown/tests/check.tftest.hcl":  "",
+				"unknown/checks/check.tftest.hcl": "",
+			},
+			want: []string{".", "custom", "module"},
+		},
+		{
+			name: "invalid nested config prevents using an ancestor module",
+			files: map[string]string{
+				"main.tf":                        "",
+				".tofu-test.yaml":                "args: [-test-directory=broken/checks]\n",
+				"broken/.tofu-test.yaml":         "args: [\n",
+				"broken/checks/check.tftest.hcl": "",
+			},
+			want: []string{"broken"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -105,6 +128,47 @@ func TestFindTestDirs_CustomDirectoriesAndModulesNamedTests(t *testing.T) {
 				t.Errorf("findTestDirs() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunTofuTestCLI_InvalidRootConfigRunsNestedModules(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		".tofu-test.yaml":                "args: [\n",
+		"module/main.tf":                 "",
+		"module/tests/check.tftest.hcl":  "",
+		"custom/.tofu-test.yaml":         "workspace: sandbox\nargs: [-test-directory=checks]\n",
+		"custom/checks/check.tftest.hcl": "",
+		"unknown/tests/check.tftest.hcl": "",
+	}
+	for name, content := range files {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visited := make(map[string]string)
+	var summary string
+	err := RunTofuTestCLI(nil, func() bool { return true }, func() (string, error) { return root, nil },
+		findTestDirs, func(dir string, _ []string, workspace string) (string, error) {
+			rel, err := filepath.Rel(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			visited[rel] = workspace
+			return "passed", nil
+		}, func(_, msg string) { summary = msg })
+	if err == nil || !strings.Contains(err.Error(), ".tofu-test.yaml") {
+		t.Errorf("expected root config error, got %v", err)
+	}
+	if want := map[string]string{"custom": "sandbox", "module": ""}; !reflect.DeepEqual(visited, want) {
+		t.Errorf("visited = %v, want %v", visited, want)
+	}
+	if summary != "2/3 test directories passed  ·  1 failed" {
+		t.Errorf("summary = %q", summary)
 	}
 }
 

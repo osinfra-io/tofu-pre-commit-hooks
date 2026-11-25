@@ -81,13 +81,13 @@ func findTestDirs(rootDir string, extraArgs []string) ([]string, error) {
 	for dir := range testDirs {
 		if explicitModules[dir] {
 			result[dir] = true
-		} else if withinBadConfig(dir, badConfig) {
-			continue
 		} else if owners, ok := selected[dir]; ok {
 			for _, module := range owners {
-				result[module] = true
+				if !withinBadConfig(dir, badConfig) || (explicitModules[module] && !badConfigBetween(dir, module, badConfig)) {
+					result[module] = true
+				}
 			}
-		} else if !known[dir] {
+		} else if !known[dir] && !withinBadConfig(dir, badConfig) {
 			result[dir] = true
 		}
 	}
@@ -97,6 +97,19 @@ func findTestDirs(rootDir string, extraArgs []string) ([]string, error) {
 	}
 	slices.Sort(dirs)
 	return dirs, nil
+}
+
+func badConfigBetween(dir, module string, badConfig map[string]bool) bool {
+	rel, err := filepath.Rel(module, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	for parent := dir; parent != module; parent = filepath.Dir(parent) {
+		if badConfig[parent] {
+			return true
+		}
+	}
+	return false
 }
 
 func testDirectory(args []string) (string, error) {
