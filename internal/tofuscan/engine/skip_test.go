@@ -1,15 +1,18 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"tofu-pre-commit-hooks/internal/tofuscan/policies"
 )
 
 func readFileSkips(t *testing.T, path string) map[string]map[string]string {
 	t.Helper()
-	skips, err := parseFileSkips(path)
+	skips, err := parseFileSkips(path, make(map[string]globalSkip))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +154,7 @@ func TestFilterSkipped(t *testing.T) {
 }
 
 func TestParseFileSkipsNonexistentFile(t *testing.T) {
-	_, err := parseFileSkips(filepath.Join(t.TempDir(), "nonexistent.tofu"))
+	_, err := parseFileSkips(filepath.Join(t.TempDir(), "nonexistent.tofu"), make(map[string]globalSkip))
 	if err == nil {
 		t.Fatal("expected an error for nonexistent file")
 	}
@@ -320,5 +323,144 @@ func TestParseFileSkipsLongLine(t *testing.T) {
 	skips := readFileSkips(t, path)
 	if skips["a.long"]["1.1"] != "long string is acceptable" {
 		t.Fatalf("expected skip after long line, got %#v", skips)
+	}
+}
+
+func TestGlobalSkipFiltersOnlyMatchingGlobalFindings(t *testing.T) {
+	dir := t.TempDir()
+	directives := filepath.Join(dir, "directives.tofu")
+	project := filepath.Join(dir, "project.tofu")
+	if err := os.WriteFile(directives, []byte("# tofu-scan skip-global: CIS 1.17 - Managed at the organization level\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(project, []byte("resource \"google_project\" \"this\" {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{directives, project}
+	skips, err := ParseSkipDirectives(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(context.Background(), files, policies.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Violations = append(result.Violations, Violation{Resource: "google_project.this", File: project, CISControl: "1.17"})
+	kept, skipped := skips.Filter(result.Violations)
+	if len(skipped) != 1 || skipped[0].RuleID != "gcp/cis/1.17" || skipped[0].SkipReason != "Managed at the organization level" {
+		t.Fatalf("unexpected skipped findings: %+v", skipped)
+	}
+	foundResource := false
+	for _, v := range kept {
+		if v.Resource == "google_project.this" && v.CISControl == "1.17" {
+			foundResource = true
+		}
+	}
+	if !foundResource {
+		t.Fatal("global skip must not suppress resource-level findings")
+	}
+}
+
+func TestGlobalSkipValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{"missing reason", "# tofu-scan skip-global: CIS 1.17\n", "non-empty reason"},
+		{"empty reason", "# tofu-scan skip-global: CIS 1.17 - \n", "non-empty reason"},
+		{"missing control", "# tofu-scan skip-global: CIS\n", "non-empty reason"},
+		{"inside resource", "resource \"a\" \"b\" {\n  # tofu-scan skip-global: CIS 1.17 - reason\n}\n", "must be at the top level"},
+		{"inside other block", "variable \"a\" {\n  # tofu-scan skip-global: CIS 1.17 - reason\n}\n", "must be at the top level"},
+		{"inline in resource without reason", "resource \"a\" \"b\" {\n  name = \"example\" # tofu-scan skip-global: CIS 1.17\n}\n", "must be on its own line"},
+		{"inline at top level", "variable \"a\" {} # tofu-scan skip-global: CIS 1.17 - reason\n", "must be on its own line"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "main.tofu")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := ParseSkipDirectives([]string{path})
+			if err == nil || !strings.Contains(err.Error(), path+":") || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected location and %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestGlobalSkipDuplicatesAndNonComments(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.tofu")
+	second := filepath.Join(dir, "second.tofu")
+	content := `# tofu-scan skip-global: CIS 1.17 - first reason
+/*
+# tofu-scan skip-global: CIS 2.2
+*/
+resource "a" "b" {
+  script = <<-SCRIPT
+    # tofu-scan skip-global: CIS 2.3
+  SCRIPT
+}
+`
+	if err := os.WriteFile(first, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skips, err := ParseSkipDirectives([]string{first})
+	if err != nil || len(skips.globalLevel) != 1 {
+		t.Fatalf("expected only the real directive, got %+v and %v", skips, err)
+	}
+	if err := os.WriteFile(second, []byte("# tofu-scan skip-global: CIS 1.17 - second reason\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ParseSkipDirectives([]string{first, second})
+	if err == nil || !strings.Contains(err.Error(), "duplicate skip-global") || !strings.Contains(err.Error(), first+":1") || !strings.Contains(err.Error(), second+":1") {
+		t.Fatalf("expected duplicate diagnostic with both locations, got %v", err)
+	}
+}
+
+func TestGlobalSkipSameFileAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.tofu")
+	symlink := filepath.Join(dir, "symlink.tofu")
+	hardlink := filepath.Join(dir, "hardlink.tofu")
+	content := `# tofu-scan skip-global: CIS 1.17 - organization contact
+resource "a" "b" {
+  # tofu-scan skip: CIS 1.1 - resource exception
+}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(path, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	alias := dir + "/./main.tofu"
+	files := []string{path, alias, symlink, hardlink}
+	skips, err := ParseSkipDirectives(files)
+	if err != nil {
+		t.Fatalf("expected aliases to be accepted: %v", err)
+	}
+	if len(skips.globalLevel) != 1 || skips.globalLevel["1.17"].reason != "organization contact" {
+		t.Fatalf("unexpected global skips: %+v", skips.globalLevel)
+	}
+	for _, file := range files {
+		if skips.resourceLevel[file]["a.b"]["1.1"] != "resource exception" {
+			t.Errorf("missing resource skip for %s", file)
+		}
+	}
+}
+
+func TestGlobalSkipDuplicateLinesInSameFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.tofu")
+	content := "# tofu-scan skip-global: CIS 1.17 - first\n# tofu-scan skip-global: CIS 1.17 - second\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ParseSkipDirectives([]string{path})
+	if err == nil || !strings.Contains(err.Error(), "duplicate skip-global") || !strings.Contains(err.Error(), path+":1") || !strings.Contains(err.Error(), path+":2") {
+		t.Fatalf("expected duplicate diagnostic with both lines, got %v", err)
 	}
 }
