@@ -15,7 +15,7 @@ type Options struct {
 
 // ParseArgs removes hook options while preserving OpenTofu arguments and values.
 func ParseArgs(args []string) (Options, []string, error) {
-	options := Options{Jobs: min(4, runtime.GOMAXPROCS(0))}
+	options := Options{Jobs: min(8, runtime.GOMAXPROCS(0))}
 	var extraArgs []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

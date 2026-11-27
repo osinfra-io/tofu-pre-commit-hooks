@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 
@@ -136,13 +139,16 @@ func TestRunTofuTestCLI_RunsEveryDirectoryAfterFailure(t *testing.T) {
 	rootCause := errors.New("test failed")
 	dirs := []string{"/fake/a", "/fake/b"}
 	var visited []string
+	var mu sync.Mutex
 	err := RunTofuTestCLI(
 		[]string{"-verbose"},
 		func() bool { return true },
 		func() (string, error) { return "/fake", nil },
 		func(string, []string) ([]string, error) { return dirs, nil },
 		func(dir string, args []string, workspace string) (string, error) {
+			mu.Lock()
 			visited = append(visited, dir)
+			mu.Unlock()
 			if !reflect.DeepEqual(args, []string{"-verbose"}) {
 				t.Errorf("unexpected arguments: %v", args)
 			}
@@ -156,8 +162,105 @@ func TestRunTofuTestCLI_RunsEveryDirectoryAfterFailure(t *testing.T) {
 	if !errors.Is(err, rootCause) {
 		t.Errorf("expected test failure, got %v", err)
 	}
+	slices.Sort(visited)
 	if !reflect.DeepEqual(visited, dirs) {
 		t.Errorf("visited %v, want %v", visited, dirs)
+	}
+}
+
+func TestRunTofuTestCLI_ConcurrentJobs(t *testing.T) {
+	dirs := []string{"/fake/a", "/fake/b", "/fake/c"}
+	started := make(chan string, len(dirs))
+	release := make(chan struct{})
+	defer close(release)
+	done := make(chan error, 1)
+	go func() {
+		done <- RunTofuTestCLI(
+			[]string{"--jobs=2", "-var", "x=y"},
+			func() bool { return true },
+			func() (string, error) { return "/fake", nil },
+			func(_ string, args []string) ([]string, error) {
+				if !reflect.DeepEqual(args, []string{"-var", "x=y"}) {
+					t.Errorf("discovery arguments = %v", args)
+				}
+				return dirs, nil
+			},
+			func(dir string, args []string, _ string) (string, error) {
+				if !reflect.DeepEqual(args, []string{"-var", "x=y"}) {
+					t.Errorf("test arguments = %v", args)
+				}
+				started <- dir
+				<-release
+				return dir, nil
+			},
+			func(string, string) {},
+		)
+	}()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("test directories did not run concurrently")
+		}
+	}
+	select {
+	case dir := <-started:
+		t.Fatalf("worker limit exceeded by %s", dir)
+	default:
+	}
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("remaining test directory did not start")
+	}
+	release <- struct{}{}
+	release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("test runner did not finish")
+	}
+}
+
+func TestRunTofuTestCLI_InvalidJobs(t *testing.T) {
+	err := RunTofuTestCLI(
+		[]string{"--jobs=0"},
+		func() bool { t.Error("unexpected installation check"); return true },
+		func() (string, error) { return "", nil },
+		func(string, []string) ([]string, error) { return nil, nil },
+		func(string, []string, string) (string, error) { return "", nil },
+		func(string, string) {},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--jobs") {
+		t.Fatalf("expected invalid jobs error, got %v", err)
+	}
+}
+
+func TestRunTofuTestCLI_SerialJobs(t *testing.T) {
+	dirs := []string{"/fake/a", "/fake/b", "/fake/c"}
+	var visited []string
+	err := RunTofuTestCLI(
+		[]string{"--jobs", "1"},
+		func() bool { return true },
+		func() (string, error) { return "/fake", nil },
+		func(_ string, args []string) ([]string, error) {
+			if len(args) != 0 {
+				t.Errorf("unexpected discovery arguments: %v", args)
+			}
+			return dirs, nil
+		},
+		func(dir string, _ []string, _ string) (string, error) {
+			visited = append(visited, dir)
+			return "", nil
+		},
+		func(string, string) {},
+	)
+	if err != nil || !reflect.DeepEqual(visited, dirs) {
+		t.Fatalf("visited %v, error %v; want %v", visited, err, dirs)
 	}
 }
 

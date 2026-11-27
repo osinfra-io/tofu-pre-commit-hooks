@@ -3,6 +3,7 @@ package tofurun
 import (
 	"errors"
 	"reflect"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,8 +36,8 @@ func TestParseArgs(t *testing.T) {
 				return
 			}
 			if tc.jobs == 0 {
-				if options.Jobs < 1 || options.Jobs > 4 {
-					t.Errorf("default jobs = %d, want 1..4", options.Jobs)
+				if want := min(8, runtime.GOMAXPROCS(0)); options.Jobs != want {
+					t.Errorf("default jobs = %d, want %d", options.Jobs, want)
 				}
 			} else if options.Jobs != tc.jobs {
 				t.Errorf("jobs = %d, want %d", options.Jobs, tc.jobs)
