@@ -240,6 +240,31 @@ func TestRunTofuTestCLI_InvalidJobs(t *testing.T) {
 	}
 }
 
+func TestRunTofuTestCLI_PreservesHookLikeTofuArguments(t *testing.T) {
+	args := []string{"-var-file", "--skip-init", "-filter", "--jobs=2", "--", "--jobs=3"}
+	err := RunTofuTestCLI(
+		args,
+		func() bool { return true },
+		func() (string, error) { return "/fake", nil },
+		func(_ string, got []string) ([]string, error) {
+			if !reflect.DeepEqual(got, args) {
+				t.Errorf("discovery arguments = %v, want %v", got, args)
+			}
+			return []string{"/fake"}, nil
+		},
+		func(_ string, got []string, _ string) (string, error) {
+			if !reflect.DeepEqual(got, args) {
+				t.Errorf("test arguments = %v, want %v", got, args)
+			}
+			return "", nil
+		},
+		func(string, string) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunTofuTestCLI_SerialJobs(t *testing.T) {
 	dirs := []string{"/fake/a", "/fake/b", "/fake/c"}
 	var visited []string

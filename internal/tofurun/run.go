@@ -20,6 +20,9 @@ func ParseArgs(args []string) (Options, []string, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case arg == "--":
+			extraArgs = append(extraArgs, args[i:]...)
+			return options, extraArgs, nil
 		case arg == "--skip-init":
 			options.SkipInit = true
 		case arg == "--jobs" || strings.HasPrefix(arg, "--jobs="):
@@ -38,6 +41,18 @@ func ParseArgs(args []string) (Options, []string, error) {
 			options.Jobs = jobs
 		default:
 			extraArgs = append(extraArgs, arg)
+			if !strings.HasPrefix(arg, "-") {
+				continue
+			}
+			name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+			switch name {
+			case "backend-config", "deprecation", "filter", "from-module", "json-into",
+				"lint", "lock-timeout", "lockfile", "plugin-dir", "test-directory", "var", "var-file":
+				if i+1 < len(args) {
+					i++
+					extraArgs = append(extraArgs, args[i])
+				}
+			}
 		}
 	}
 	return options, extraArgs, nil
