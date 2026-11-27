@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"tofu-pre-commit-hooks/internal/testutil"
@@ -151,14 +152,17 @@ func TestRunTofuTestCLI_InvalidRootConfigRunsNestedModules(t *testing.T) {
 		}
 	}
 	visited := make(map[string]string)
+	var mu sync.Mutex
 	var summary string
 	err := RunTofuTestCLI(nil, func() bool { return true }, func() (string, error) { return root, nil },
 		findTestDirs, func(dir string, _ []string, workspace string) (string, error) {
 			rel, err := filepath.Rel(root, dir)
 			if err != nil {
-				t.Fatal(err)
+				return "", err
 			}
+			mu.Lock()
 			visited[rel] = workspace
+			mu.Unlock()
 			return "passed", nil
 		}, func(_, msg string) { summary = msg })
 	if err == nil || !strings.Contains(err.Error(), ".tofu-test.yaml") {
@@ -193,13 +197,16 @@ func TestRunTofuTestCLI_StandaloneTestsModuleAndInvalidConfig(t *testing.T) {
 		}
 	}
 	visited := make(map[string]string)
+	var mu sync.Mutex
 	err := RunTofuTestCLI(nil, func() bool { return true }, func() (string, error) { return root, nil },
 		findTestDirs, func(dir string, args []string, workspace string) (string, error) {
 			rel, err := filepath.Rel(root, dir)
 			if err != nil {
-				t.Fatal(err)
+				return "", err
 			}
+			mu.Lock()
 			visited[rel] = workspace
+			mu.Unlock()
 			if rel == "modules/tests" && !reflect.DeepEqual(args, []string{"-verbose"}) {
 				t.Errorf("module args = %v", args)
 			}

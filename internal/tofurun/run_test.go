@@ -3,6 +3,7 @@ package tofurun
 import (
 	"errors"
 	"reflect"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,10 @@ func TestParseArgs(t *testing.T) {
 		{name: "default"},
 		{name: "equals", args: []string{"-no-color", "--jobs=2", "--skip-init"}, jobs: 2, skipInit: true, extra: []string{"-no-color"}},
 		{name: "split and tofu values", args: []string{"--jobs", "1", "-var", "message=value"}, jobs: 1, extra: []string{"-var", "message=value"}},
+		{name: "hook-like tofu values", args: []string{"-var-file", "--jobs=2", "--filter", "--skip-init", "--jobs=3"}, jobs: 3, extra: []string{"-var-file", "--jobs=2", "--filter", "--skip-init"}},
+		{name: "equals-form tofu flag", args: []string{"-var-file=vars.tfvars", "--jobs=2"}, jobs: 2, extra: []string{"-var-file=vars.tfvars"}},
+		{name: "end of options", args: []string{"--jobs=2", "--", "--jobs=3", "--skip-init"}, jobs: 2, extra: []string{"--", "--jobs=3", "--skip-init"}},
+		{name: "end marker as tofu value", args: []string{"-var-file", "--", "--jobs=2"}, jobs: 2, extra: []string{"-var-file", "--"}},
 		{name: "missing jobs", args: []string{"--jobs"}, wantErr: true},
 		{name: "empty jobs", args: []string{"--jobs="}, wantErr: true},
 		{name: "zero jobs", args: []string{"--jobs=0"}, wantErr: true},
@@ -35,8 +40,8 @@ func TestParseArgs(t *testing.T) {
 				return
 			}
 			if tc.jobs == 0 {
-				if options.Jobs < 1 || options.Jobs > 4 {
-					t.Errorf("default jobs = %d, want 1..4", options.Jobs)
+				if want := min(8, runtime.GOMAXPROCS(0)); options.Jobs != want {
+					t.Errorf("default jobs = %d, want %d", options.Jobs, want)
 				}
 			} else if options.Jobs != tc.jobs {
 				t.Errorf("jobs = %d, want %d", options.Jobs, tc.jobs)

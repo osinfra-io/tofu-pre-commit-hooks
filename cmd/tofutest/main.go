@@ -10,6 +10,7 @@ import (
 
 	"tofu-pre-commit-hooks/internal/output"
 	"tofu-pre-commit-hooks/internal/testutil"
+	"tofu-pre-commit-hooks/internal/tofurun"
 )
 
 func main() {
@@ -35,6 +36,16 @@ func RunTofuTestCLI(
 	runTest func(string, []string, string) (string, error),
 	printStatus func(string, string),
 ) error {
+	options, extraArgs, err := tofurun.ParseArgs(extraArgs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
+	if options.SkipInit {
+		err := fmt.Errorf("--skip-init is not supported by tofu-test; dependencies must already be initialized")
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
 	if !checkInstalled() {
 		fmt.Println("OpenTofu is not installed or not in PATH.")
 		return fmt.Errorf("OpenTofu not installed")
@@ -64,18 +75,22 @@ func RunTofuTestCLI(
 	}
 	var passed, failed []testResult
 	var testErrors []error
-	for _, dir := range dirs {
+	options.SkipInit = true
+	results := tofurun.Run(dirs, options, nil, func(dir string) (string, error) {
 		config, err := readTestConfig(dir)
-		var testOutput string
 		if err == nil {
 			if _, argErr := testDirectory(config.Args); argErr != nil {
 				err = fmt.Errorf("%s: %w", filepath.Join(dir, ".tofu-test.yaml"), argErr)
 			}
 		}
-		if err == nil {
-			args := append(config.Args, extraArgs...)
-			testOutput, err = runTest(dir, args, config.Workspace)
+		if err != nil {
+			return "", err
 		}
+		args := append(config.Args, extraArgs...)
+		return runTest(dir, args, config.Workspace)
+	})
+	for i, dir := range dirs {
+		testOutput, err := results[i].Output, results[i].Err
 		relPath, relErr := filepath.Rel(rootDir, dir)
 		if relErr != nil {
 			relPath = dir

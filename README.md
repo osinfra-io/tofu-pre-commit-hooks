@@ -29,13 +29,15 @@ Unused-local and unused-variable warnings account for shared files: a declaratio
 
 This hook performs full validation as well as lint checks. Configure `tofu-lint` instead of both `tofu-validate` and `tofu-lint` to avoid validating every directory twice.
 
-Both hooks check up to four directories concurrently, limited by available CPUs, while keeping initialization serial to protect shared provider caches. Set `args: ["--jobs=1"]` for serial execution, or choose another positive worker count. Initialization remains enabled by default. `args: ["--skip-init"]` skips it only when the caller manages dependency initialization; rerun `tofu init -backend=false` after changing module sources, provider requirements, or lockfiles. Validation alone does not reliably detect stale provider selections.
+Both hooks check up to eight directories concurrently, limited by available CPUs, while keeping initialization serial to protect shared provider caches. Set `args: ["--jobs=1"]` for serial execution, or choose another positive worker count. Initialization remains enabled by default. `args: ["--skip-init"]` skips it only when the caller manages dependency initialization; rerun `tofu init -backend=false` after changing module sources, provider requirements, or lockfiles. Validation alone does not reliably detect stale provider selections.
 
 ### tofu-test
 
 #### Runs OpenTofu automated tests
 
 Runs `tofu test` in each directory with `.tftest.hcl` files in the directory itself or its `tests/` subdirectory, excluding hidden directories. Dependencies must already be initialized. OpenTofu tests can create real infrastructure unless configured to use plan-only runs or mocks.
+
+Up to eight test directories run concurrently, limited by available CPUs. Set `args: ["--jobs=1"]` for serial execution when suites share infrastructure, or choose another positive worker count.
 
 ### tofu-scan
 
